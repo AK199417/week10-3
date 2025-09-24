@@ -4,13 +4,10 @@ on:
   workflow_call:
     inputs:
       acr_login_server:
-        required: false
+        required: true
         type: string
   pull_request:
     branches: [ main, dev, develop ]
-
-env:
-  ACR_LOGIN_SERVER: ${{ inputs.acr_login_server }}
 
 jobs:
   test_and_lint_backends:
@@ -18,7 +15,7 @@ jobs:
 
     services:
       product_db:
-        image: postgres:15
+        image: public.ecr.aws/docker/library/postgres:15
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -28,10 +25,11 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-        ports: ["5432:5432"]
+        ports:
+          - "5432:5432"
 
       order_db:
-        image: postgres:15
+        image: public.ecr.aws/docker/library/postgres:15
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -41,10 +39,11 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-        ports: ["5433:5432"]
+        ports:
+          - "5433:5432"
 
       customer_db:
-        image: postgres:15
+        image: public.ecr.aws/docker/library/postgres:15
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -54,7 +53,8 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-        ports: ["5434:5432"]
+        ports:
+          - "5434:5432"
 
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +65,9 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -Eeuo pipefail
           pip install --upgrade pip
           for req in backend/*/requirements.txt; do
             echo "Installing $req"
@@ -116,33 +118,53 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Validate ACR server provided by orchestrator
+      - name: Resolve ACR and SHORT_SHA
+        shell: bash
         run: |
-          : "${ACR_LOGIN_SERVER:?ACR login server missing}"   # fail if empty
-          echo "Using ACR: $ACR_LOGIN_SERVER"
-          echo "ACR_NAME=${ACR_LOGIN_SERVER%%.*}" >> $GITHUB_ENV
+          set -Eeuo pipefail
+          ACR_LOGIN_SERVER="${{ inputs.acr_login_server }}"
+          [ -n "$ACR_LOGIN_SERVER" ] || { echo "Missing input: acr_login_server"; exit 1; }
+          echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER" >> $GITHUB_ENV
+          ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
+          echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
           echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
 
-      - name: Login to Azure Container Registry (AAD)
-        run: az acr login --name "${{ env.ACR_NAME }}"
+      - name: Login to Azure Container Registry
+        shell: bash
+        run: az acr login --name "$ACR_NAME"
 
       - name: Build & Push product_service
+        shell: bash
         run: |
-          docker build -t ${{ env.ACR_LOGIN_SERVER }}/product_service:latest -t ${{ env.ACR_LOGIN_SERVER }}/product_service:${SHORT_SHA} ./backend/product_service/
-          docker push  ${{ env.ACR_LOGIN_SERVER }}/product_service:latest
-          docker push  ${{ env.ACR_LOGIN_SERVER }}/product_service:${SHORT_SHA}
+          set -Eeuo pipefail
+          docker build \
+            -t "$ACR_LOGIN_SERVER/product_service:latest" \
+            -t "$ACR_LOGIN_SERVER/product_service:$SHORT_SHA" \
+            ./backend/product_service/
+          docker push "$ACR_LOGIN_SERVER/product_service:latest"
+          docker push "$ACR_LOGIN_SERVER/product_service:$SHORT_SHA"
 
       - name: Build & Push order_service
+        shell: bash
         run: |
-          docker build -t ${{ env.ACR_LOGIN_SERVER }}/order_service:latest -t ${{ env.ACR_LOGIN_SERVER }}/order_service:${SHORT_SHA} ./backend/order_service/
-          docker push  ${{ env.ACR_LOGIN_SERVER }}/order_service:latest
-          docker push  ${{ env.ACR_LOGIN_SERVER }}/order_service:${SHORT_SHA}
+          set -Eeuo pipefail
+          docker build \
+            -t "$ACR_LOGIN_SERVER/order_service:latest" \
+            -t "$ACR_LOGIN_SERVER/order_service:$SHORT_SHA" \
+            ./backend/order_service/
+          docker push "$ACR_LOGIN_SERVER/order_service:latest"
+          docker push "$ACR_LOGIN_SERVER/order_service:$SHORT_SHA"
 
       - name: Build & Push customer_service
+        shell: bash
         run: |
-          docker build -t ${{ env.ACR_LOGIN_SERVER }}/customer_service:latest -t ${{ env.ACR_LOGIN_SERVER }}/customer_service:${SHORT_SHA} ./backend/customer_service/
-          docker push  ${{ env.ACR_LOGIN_SERVER }}/customer_service:latest
-          docker push  ${{ env.ACR_LOGIN_SERVER }}/customer_service:${SHORT_SHA}
+          set -Eeuo pipefail
+          docker build \
+            -t "$ACR_LOGIN_SERVER/customer_service:latest" \
+            -t "$ACR_LOGIN_SERVER/customer_service:$SHORT_SHA" \
+            ./backend/customer_service/
+          docker push "$ACR_LOGIN_SERVER/customer_service:latest"
+          docker push "$ACR_LOGIN_SERVER/customer_service:$SHORT_SHA"
 
       - name: Logout Azure
         if: always()
