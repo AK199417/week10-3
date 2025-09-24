@@ -133,6 +133,19 @@ jobs:
         shell: bash
         run: az acr login --name "$ACR_NAME"
 
+      # >>> New step: rewrite backend Dockerfiles to use ECR Public mirror for Python base images
+      - name: Patch backend Dockerfiles to use ECR Public base images
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for df in backend/*/Dockerfile; do
+            echo "Patching $df"
+            # Replace lines like: FROM python:3.10-slim-buster
+            sed -i -E 's|^FROM[[:space:]]+python:([[:alnum:]._-]+)|FROM public.ecr.aws/docker/library/python:\1|' "$df"
+          done
+          echo "Patched Dockerfiles:"
+          grep -R --line-number '^FROM ' backend/*/Dockerfile || true
+
       - name: Build & Push product_service
         shell: bash
         run: |
