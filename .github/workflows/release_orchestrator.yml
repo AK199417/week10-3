@@ -45,7 +45,7 @@ jobs:
       - name: Import existing ACR if present (DEV)
         working-directory: infra
         env:
-          ACR_NAME: devacr
+          ACR_NAME: akdevacr
         run: |
           set -euo pipefail
           if az acr show -n "$ACR_NAME" >/dev/null 2>&1; then
@@ -59,7 +59,7 @@ jobs:
       - name: Import existing AKS if present (DEV)
         working-directory: infra
         env:
-          RG_NAME: rg-ecom-dev
+          RG_NAME: deakinuni           # <— existing RG
           AKS_NAME: devaks
         run: |
           set -euo pipefail
@@ -79,9 +79,9 @@ jobs:
 
       - name: Ensure RBAC AKS can pull from ACR (DEV)
         env:
-          RG_NAME: rg-ecom-dev
-          ACR_NAME: devacr
-          AKS_NAME: devaks
+          RG_NAME: deakinuni           # <— existing RG
+          ACR_NAME: akdevacr
+          AKS_NAME: akdevaks
         run: |
           set -euo pipefail
           ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
@@ -93,7 +93,7 @@ jobs:
 
       - name: Install jq (for parsing TF outputs)
         run: |
-          if ! command -v jq >/dev/null 2%; then
+          if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y jq
           fi
 
@@ -187,7 +187,7 @@ jobs:
       - name: Import existing ACR if present (PROD)
         working-directory: infra
         env:
-          ACR_NAME: prodacr
+          ACR_NAME: akprodacr
         run: |
           set -euo pipefail
           if az acr show -n "$ACR_NAME" >/dev/null 2>&1; then
@@ -201,7 +201,7 @@ jobs:
       - name: Import existing AKS if present (PROD)
         working-directory: infra
         env:
-          RG_NAME: rg-ecom-prod
+          RG_NAME: deakinuni           # <— existing RG
           AKS_NAME: prodaks
         run: |
           set -euo pipefail
@@ -221,9 +221,9 @@ jobs:
 
       - name: Ensure RBAC AKS can pull from ACR (PROD)
         env:
-          RG_NAME: rg-ecom-prod
-          ACR_NAME: prodacr
-          AKS_NAME: prodaks
+          RG_NAME: deakinuni           # <— existing RG
+          ACR_NAME: akprodacr
+          AKS_NAME: akprodaks
         run: |
           set -euo pipefail
           ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
@@ -235,7 +235,7 @@ jobs:
 
       - name: Install jq (for parsing TF outputs)
         run: |
-          if ! command -v jq >/dev/null 2%; then
+          if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y jq
           fi
 
@@ -269,7 +269,7 @@ jobs:
         id: meta
         env:
           PROD_ACR_LOGIN:    ${{ needs.infra_prod.outputs.prod_acr }}
-          DEV_ACR_LOGIN_VAR: ${{ vars.AZURE_CONTAINER_REGISTRY }}
+          DEV_ACR_LOGIN_VAR: ${{ vars.DEV_ACR_LOGIN_SERVER }}
         run: |
           set -euo pipefail
           PR_SHA="${{ github.event.pull_request.head.sha }}"
@@ -346,7 +346,7 @@ jobs:
 
       - name: Install jq (for JSON patch helper)
         run: |
-          if ! command -v jq >/dev/null 2%; then
+          if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y jq
           fi
 
