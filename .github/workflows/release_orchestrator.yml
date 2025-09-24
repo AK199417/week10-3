@@ -223,7 +223,9 @@ jobs:
           SUB_ID=$(az account show --query id -o tsv)
           if az acr show -n "$ACR_NAME" --subscription "$SUB_ID" -o none 2>/dev/null; then
             ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
-            terraform import -input=false azurerm_container_registry.acr "$ACR_ID" \
+            terraform import -input=false \
+              -var="subscription_id=$SUB_ID" -var-file=envs/prod.tfvars \
+              azurerm_container_registry.acr "$ACR_ID" \
               || { echo "Import skipped (probably already in state)"; true; }
             echo "Imported/kept ACR in state: $ACR_ID"
           else
@@ -241,12 +243,15 @@ jobs:
           SUB_ID=$(az account show --query id -o tsv)
           if az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" -o none 2>/dev/null; then
             AKS_ID="/subscriptions/${SUB_ID}/resourceGroups/${RG_NAME}/providers/Microsoft.ContainerService/managedClusters/${AKS_NAME}"
-            terraform import -input=false azurerm_kubernetes_cluster.aks "$AKS_ID" \
+            terraform import -input=false \
+              -var="subscription_id=$SUB_ID" -var-file=envs/prod.tfvars \
+              azurerm_kubernetes_cluster.aks "$AKS_ID" \
               || { echo "Import skipped (probably already in state)"; true; }
             echo "Imported/kept AKS in state: $AKS_ID"
           else
             echo "AKS $AKS_NAME not found; Terraform will create it."
           fi
+
 
 
       - name: Terraform apply (PROD)
