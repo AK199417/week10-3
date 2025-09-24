@@ -47,29 +47,43 @@ jobs:
         env:
           ACR_NAME: akdevacr
         run: |
-          set -euo pipefail
-          if az acr show -n "$ACR_NAME" >/dev/null 2>&1; then
-            ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
-            terraform state show azurerm_container_registry.acr >/dev/null 2>&1 || terraform import azurerm_container_registry.acr "$ACR_ID"
+          set -Eeuo pipefail
+          SUB_ID=$(az account show --query id -o tsv)
+
+          echo "Fast global check for ACR name availability..."
+          if az acr check-name -n "$ACR_NAME" -o tsv --query nameAvailable | grep -qi true; then
+            echo "ACR '$ACR_NAME' is available (does not exist). Skipping import; Terraform will create it."
+            exit 0
+          fi
+
+          echo "Name is taken; checking if it exists in this subscription for import..."
+          if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
+            ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
+            terraform state show azurerm_container_registry.acr >/dev/null 2>&1 \
+              || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
             echo "Imported existing ACR: $ACR_ID"
           else
-            echo "ACR $ACR_NAME not found; Terraform will create it."
+            echo "ACR '$ACR_NAME' is not in this subscription or not accessible; Terraform will try to create it."
           fi
 
       - name: Import existing AKS if present (DEV)
         working-directory: infra
         env:
-          RG_NAME: deakinuni           # <— existing RG
-          AKS_NAME: devaks
+          RG_NAME: deakinuni
+          AKS_NAME: akdevaks
         run: |
-          set -euo pipefail
-          if az aks show -g "$RG_NAME" -n "$AKS_NAME" >/dev/null 2>&1; then
-            AKS_ID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query id -o tsv)
-            terraform state show azurerm_kubernetes_cluster.aks >/dev/null 2>&1 || terraform import azurerm_kubernetes_cluster.aks "$AKS_ID"
+          set -Eeuo pipefail
+          SUB_ID=$(az account show --query id -o tsv)
+          # Fast existence check scoped to the RG/subscription (avoids cross-tenant slowness)
+          if timeout 20s az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
+            AKS_ID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv)
+            terraform state show azurerm_kubernetes_cluster.aks >/dev/null 2>&1 \
+              || terraform import -input=false azurerm_kubernetes_cluster.aks "$AKS_ID"
             echo "Imported existing AKS: $AKS_ID"
           else
             echo "AKS $AKS_NAME not found; Terraform will create it."
           fi
+
 
       - name: Terraform apply (DEV)
         working-directory: infra
@@ -79,11 +93,11 @@ jobs:
 
       - name: Ensure RBAC AKS can pull from ACR (DEV)
         env:
-          RG_NAME: deakinuni           # <— existing RG
+          RG_NAME: deakinuni
           ACR_NAME: akdevacr
           AKS_NAME: akdevaks
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
           OID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query "identityProfile.kubeletidentity.objectId" -o tsv 2>/dev/null || true)
           if [ -z "$OID" ]; then
@@ -189,29 +203,42 @@ jobs:
         env:
           ACR_NAME: akprodacr
         run: |
-          set -euo pipefail
-          if az acr show -n "$ACR_NAME" >/dev/null 2>&1; then
-            ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
-            terraform state show azurerm_container_registry.acr >/dev/null 2>&1 || terraform import azurerm_container_registry.acr "$ACR_ID"
+          set -Eeuo pipefail
+          SUB_ID=$(az account show --query id -o tsv)
+
+          echo "Fast global check for ACR name availability..."
+          if az acr check-name -n "$ACR_NAME" -o tsv --query nameAvailable | grep -qi true; then
+            echo "ACR '$ACR_NAME' is available (does not exist). Skipping import; Terraform will create it."
+            exit 0
+          fi
+
+          echo "Name is taken; checking if it exists in this subscription for import..."
+          if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
+            ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
+            terraform state show azurerm_container_registry.acr >/dev/null 2>&1 \
+              || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
             echo "Imported existing ACR: $ACR_ID"
           else
-            echo "ACR $ACR_NAME not found; Terraform will create it."
+            echo "ACR '$ACR_NAME' is not in this subscription or not accessible; Terraform will try to create it."
           fi
 
       - name: Import existing AKS if present (PROD)
         working-directory: infra
         env:
-          RG_NAME: deakinuni           # <— existing RG
-          AKS_NAME: prodaks
+          RG_NAME: deakinuni
+          AKS_NAME: akprodaks
         run: |
-          set -euo pipefail
-          if az aks show -g "$RG_NAME" -n "$AKS_NAME" >/dev/null 2>&1; then
-            AKS_ID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query id -o tsv)
-            terraform state show azurerm_kubernetes_cluster.aks >/dev/null 2>&1 || terraform import azurerm_kubernetes_cluster.aks "$AKS_ID"
+          set -Eeuo pipefail
+          SUB_ID=$(az account show --query id -o tsv)
+          if timeout 20s az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
+            AKS_ID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv)
+            terraform state show azurerm_kubernetes_cluster.aks >/dev/null 2>&1 \
+              || terraform import -input=false azurerm_kubernetes_cluster.aks "$AKS_ID"
             echo "Imported existing AKS: $AKS_ID"
           else
             echo "AKS $AKS_NAME not found; Terraform will create it."
           fi
+
 
       - name: Terraform apply (PROD)
         working-directory: infra
@@ -221,11 +248,11 @@ jobs:
 
       - name: Ensure RBAC AKS can pull from ACR (PROD)
         env:
-          RG_NAME: deakinuni           # <— existing RG
+          RG_NAME: deakinuni
           ACR_NAME: akprodacr
           AKS_NAME: akprodaks
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
           OID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query "identityProfile.kubeletidentity.objectId" -o tsv 2>/dev/null || true)
           if [ -z "$OID" ]; then
@@ -271,7 +298,7 @@ jobs:
           PROD_ACR_LOGIN:    ${{ needs.infra_prod.outputs.prod_acr }}
           DEV_ACR_LOGIN_VAR: ${{ vars.DEV_ACR_LOGIN_SERVER }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           PR_SHA="${{ github.event.pull_request.head.sha }}"
           TAG="${PR_SHA:0:7}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -358,7 +385,7 @@ jobs:
           D_ORDR: ${{ needs.promote_images_prod.outputs.d_order_service }}
           D_CUST: ${{ needs.promote_images_prod.outputs.d_customer_service }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           repos=( "product_service:$D_PROD" "order_service:$D_ORDR" "customer_service:$D_CUST" )
           for pair in "${repos[@]}"; do
             repo="${pair%%:*}"; digest="${pair##*:}"
