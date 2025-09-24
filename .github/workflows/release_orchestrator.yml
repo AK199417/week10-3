@@ -48,6 +48,9 @@ jobs:
           ACR_NAME: akdevacr
         run: |
           set -Eeuo pipefail
+          # ensure required variables are available to all tf commands in this step
+          export TF_CLI_ARGS="-var-file=envs/dev.tfvars"
+
           SUB_ID=$(az account show --query id -o tsv)
 
           echo "Fast global check for ACR name availability..."
@@ -59,7 +62,7 @@ jobs:
           echo "Name is taken; checking if it exists in this subscription for import..."
           if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
             ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
-            terraform state show azurerm_container_registry.acr >/dev/null 2>&1 \
+            terraform state list | grep -q '^azurerm_container_registry\.acr$' \
               || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
             echo "Imported existing ACR: $ACR_ID"
           else
@@ -73,17 +76,17 @@ jobs:
           AKS_NAME: akdevaks
         run: |
           set -Eeuo pipefail
+          export TF_CLI_ARGS="-var-file=envs/dev.tfvars"
+
           SUB_ID=$(az account show --query id -o tsv)
-          # Fast existence check scoped to the RG/subscription (avoids cross-tenant slowness)
           if timeout 20s az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
             AKS_ID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv)
-            terraform state show azurerm_kubernetes_cluster.aks >/dev/null 2>&1 \
+            terraform state list | grep -q '^azurerm_kubernetes_cluster\.aks$' \
               || terraform import -input=false azurerm_kubernetes_cluster.aks "$AKS_ID"
             echo "Imported existing AKS: $AKS_ID"
           else
             echo "AKS $AKS_NAME not found; Terraform will create it."
           fi
-
 
       - name: Terraform apply (DEV)
         working-directory: infra
@@ -204,6 +207,8 @@ jobs:
           ACR_NAME: akprodacr
         run: |
           set -Eeuo pipefail
+          export TF_CLI_ARGS="-var-file=envs/prod.tfvars"
+
           SUB_ID=$(az account show --query id -o tsv)
 
           echo "Fast global check for ACR name availability..."
@@ -215,7 +220,7 @@ jobs:
           echo "Name is taken; checking if it exists in this subscription for import..."
           if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
             ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
-            terraform state show azurerm_container_registry.acr >/dev/null 2>&1 \
+            terraform state list | grep -q '^azurerm_container_registry\.acr$' \
               || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
             echo "Imported existing ACR: $ACR_ID"
           else
@@ -229,16 +234,17 @@ jobs:
           AKS_NAME: akprodaks
         run: |
           set -Eeuo pipefail
+          export TF_CLI_ARGS="-var-file=envs/prod.tfvars"
+
           SUB_ID=$(az account show --query id -o tsv)
           if timeout 20s az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
             AKS_ID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv)
-            terraform state show azurerm_kubernetes_cluster.aks >/dev/null 2>&1 \
+            terraform state list | grep -q '^azurerm_kubernetes_cluster\.aks$' \
               || terraform import -input=false azurerm_kubernetes_cluster.aks "$AKS_ID"
             echo "Imported existing AKS: $AKS_ID"
           else
             echo "AKS $AKS_NAME not found; Terraform will create it."
           fi
-
 
       - name: Terraform apply (PROD)
         working-directory: infra
