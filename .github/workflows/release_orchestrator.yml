@@ -16,10 +16,11 @@ permissions:
   contents: read
 
 env:
-  # Static names you chose
+  # Final names you chose
   DEV_RG: deakinuni
   DEV_ACR_NAME: akdevacr
   DEV_AKS_NAME: akdevaks
+
   PROD_RG: deakinuni
   PROD_ACR_NAME: akprodacr
   PROD_AKS_NAME: akprodaks
@@ -56,7 +57,7 @@ jobs:
           set -Eeuo pipefail
           SUB_ID=$(az account show --query id -o tsv)
           if az acr check-name -n "$ACR_NAME" -o tsv --query nameAvailable | grep -qi true; then
-            echo "ACR '$ACR_NAME' does not exist. Skip import."
+            echo "ACR '$ACR_NAME' not found globally; will be created by TF."
           else
             if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
               ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
@@ -64,7 +65,7 @@ jobs:
                 || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
               echo "Imported ACR: $ACR_ID"
             else
-              echo "ACR exists but not accessible; TF will try to create (will fail if name global-taken)."
+              echo "ACR exists globally but not accessible; TF create may fail if name is taken."
             fi
           fi
 
@@ -215,7 +216,7 @@ jobs:
           set -Eeuo pipefail
           SUB_ID=$(az account show --query id -o tsv)
           if az acr check-name -n "$ACR_NAME" -o tsv --query nameAvailable | grep -qi true; then
-            echo "ACR '$ACR_NAME' does not exist. Skip import."
+            echo "ACR '$ACR_NAME' not found globally; will be created by TF."
           else
             if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
               ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
@@ -223,7 +224,7 @@ jobs:
                 || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
               echo "Imported ACR: $ACR_ID"
             else
-              echo "ACR exists but not accessible; TF will try to create (will fail if name global-taken)."
+              echo "ACR exists globally but not accessible; TF create may fail if name is taken."
             fi
           fi
 
