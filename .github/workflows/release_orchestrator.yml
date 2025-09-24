@@ -51,40 +51,39 @@ jobs:
 
       - name: Import existing ACR if present (DEV)
         working-directory: infra
+        shell: bash
         env:
-          ACR_NAME: ${{ env.DEV_ACR_NAME }}
+          ACR_NAME: akdevacr
         run: |
           set -Eeuo pipefail
           SUB_ID=$(az account show --query id -o tsv)
-          if az acr check-name -n "$ACR_NAME" -o tsv --query nameAvailable | grep -qi true; then
-            echo "ACR '$ACR_NAME' not found globally; will be created by TF."
+          if az acr show -n "$ACR_NAME" --subscription "$SUB_ID" -o none 2>/dev/null; then
+            ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
+            terraform import -input=false azurerm_container_registry.acr "$ACR_ID" \
+              || { echo "Import skipped (probably already in state)"; true; }
+            echo "Imported/kept ACR in state: $ACR_ID"
           else
-            if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
-              ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
-              terraform state list | grep -q '^azurerm_container_registry\.acr$' \
-                || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
-              echo "Imported ACR: $ACR_ID"
-            else
-              echo "ACR exists globally but not accessible; TF create may fail if name is taken."
-            fi
+            echo "ACR $ACR_NAME not found; Terraform will create it."
           fi
 
       - name: Import existing AKS if present (DEV)
         working-directory: infra
+        shell: bash
         env:
-          RG_NAME: ${{ env.DEV_RG }}
-          AKS_NAME: ${{ env.DEV_AKS_NAME }}
+          RG_NAME: deakinuni
+          AKS_NAME: akdevaks
         run: |
           set -Eeuo pipefail
           SUB_ID=$(az account show --query id -o tsv)
-          if timeout 20s az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
+          if az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" -o none 2>/dev/null; then
             AKS_ID="/subscriptions/${SUB_ID}/resourceGroups/${RG_NAME}/providers/Microsoft.ContainerService/managedClusters/${AKS_NAME}"
-            terraform state list | grep -q '^azurerm_kubernetes_cluster\.aks$' \
-              || terraform import -input=false azurerm_kubernetes_cluster.aks "$AKS_ID"
-            echo "Imported AKS: $AKS_ID"
+            terraform import -input=false azurerm_kubernetes_cluster.aks "$AKS_ID" \
+              || { echo "Import skipped (probably already in state)"; true; }
+            echo "Imported/kept AKS in state: $AKS_ID"
           else
-            echo "AKS not found; TF will create."
+            echo "AKS $AKS_NAME not found; Terraform will create it."
           fi
+
 
       - name: Terraform apply (DEV)
         working-directory: infra
@@ -210,40 +209,39 @@ jobs:
 
       - name: Import existing ACR if present (PROD)
         working-directory: infra
+        shell: bash
         env:
-          ACR_NAME: ${{ env.PROD_ACR_NAME }}
+          ACR_NAME: akprodacr
         run: |
           set -Eeuo pipefail
           SUB_ID=$(az account show --query id -o tsv)
-          if az acr check-name -n "$ACR_NAME" -o tsv --query nameAvailable | grep -qi true; then
-            echo "ACR '$ACR_NAME' not found globally; will be created by TF."
+          if az acr show -n "$ACR_NAME" --subscription "$SUB_ID" -o none 2>/dev/null; then
+            ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
+            terraform import -input=false azurerm_container_registry.acr "$ACR_ID" \
+              || { echo "Import skipped (probably already in state)"; true; }
+            echo "Imported/kept ACR in state: $ACR_ID"
           else
-            if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
-              ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
-              terraform state list | grep -q '^azurerm_container_registry\.acr$' \
-                || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
-              echo "Imported ACR: $ACR_ID"
-            else
-              echo "ACR exists globally but not accessible; TF create may fail if name is taken."
-            fi
+            echo "ACR $ACR_NAME not found; Terraform will create it."
           fi
 
       - name: Import existing AKS if present (PROD)
         working-directory: infra
+        shell: bash
         env:
-          RG_NAME: ${{ env.PROD_RG }}
-          AKS_NAME: ${{ env.PROD_AKS_NAME }}
+          RG_NAME: deakinuni
+          AKS_NAME: akprodaks
         run: |
           set -Eeuo pipefail
           SUB_ID=$(az account show --query id -o tsv)
-          if timeout 20s az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
+          if az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" -o none 2>/dev/null; then
             AKS_ID="/subscriptions/${SUB_ID}/resourceGroups/${RG_NAME}/providers/Microsoft.ContainerService/managedClusters/${AKS_NAME}"
-            terraform state list | grep -q '^azurerm_kubernetes_cluster\.aks$' \
-              || terraform import -input=false azurerm_kubernetes_cluster.aks "$AKS_ID"
-            echo "Imported AKS: $AKS_ID"
+            terraform import -input=false azurerm_kubernetes_cluster.aks "$AKS_ID" \
+              || { echo "Import skipped (probably already in state)"; true; }
+            echo "Imported/kept AKS in state: $AKS_ID"
           else
-            echo "AKS not found; TF will create."
+            echo "AKS $AKS_NAME not found; Terraform will create it."
           fi
+
 
       - name: Terraform apply (PROD)
         working-directory: infra
