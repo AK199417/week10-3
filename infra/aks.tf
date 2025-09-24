@@ -15,6 +15,14 @@ resource "azurerm_kubernetes_cluster" "aks" {
     type = "SystemAssigned"
   }
 
+  # 🔽 Hook AKS to Log Analytics when enabled
+  dynamic "oms_agent" {
+    for_each = var.enable_container_insights ? [1] : []
+    content {
+      log_analytics_workspace_id = azurerm_log_analytics_workspace.law.id
+    }
+  }
+
   network_profile {
     network_plugin    = "azure"
     load_balancer_sku = "standard"

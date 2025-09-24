@@ -41,3 +41,21 @@ variable "tags" {
   type    = map(string)
   default = {}
 }
+
+# 🔽 NEW: Log Analytics options
+variable "law_name" {
+  description = "Optional custom name for Log Analytics Workspace; if empty, a name will be generated."
+  type        = string
+  default     = ""
+}
+
+variable "law_retention_days" {
+  type    = number
+  default = 30
+}
+
+variable "enable_container_insights" {
+  description = "Enable AKS OMS agent hooked to Log Analytics."
+  type        = bool
+  default     = true
+}
