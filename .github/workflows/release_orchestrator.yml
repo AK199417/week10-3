@@ -171,7 +171,9 @@ jobs:
     uses: ./.github/workflows/backend-cd.yml
     with:
       k8s_namespace: dev
-      acr_login_server: ${{ needs.infra_dev.outputs.dev_acr }}
+      aks_cluster_name:  ${{ needs.infra_dev.outputs.dev_aks_name }}
+      aks_resource_group: ${{ needs.infra_dev.outputs.dev_aks_rg }}
+      acr_login_server:  ${{ needs.infra_dev.outputs.dev_acr }}
     secrets: inherit
 
   frontend_cd_dev:
@@ -385,7 +387,9 @@ jobs:
     uses: ./.github/workflows/backend-cd.yml
     with:
       k8s_namespace: ecommerce
-      acr_login_server: ${{ needs.infra_prod.outputs.prod_acr }}
+      aks_cluster_name:   ${{ needs.infra_prod.outputs.prod_aks_name }}
+      aks_resource_group: ${{ needs.infra_prod.outputs.prod_aks_rg }}
+      acr_login_server:   ${{ needs.infra_prod.outputs.prod_acr }}
     secrets: inherit
 
   pin_backend_prod:
