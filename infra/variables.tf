@@ -14,13 +14,11 @@ variable "app_name" {
   default = "ecom"
 }
 
-# 🔹 Use an existing RG by name
 variable "resource_group_name" {
-  description = "Name of an existing Azure Resource Group to deploy into"
+  description = "Existing Azure Resource Group to deploy into"
   type        = string
 }
 
-# Explicit names so you get devacr/prodacr, devaks/prodaks
 variable "acr_name" {
   type = string
 }
@@ -29,7 +27,6 @@ variable "aks_name" {
   type = string
 }
 
-# AKS sizing
 variable "aks_node_count" {
   type    = number
   default = 2

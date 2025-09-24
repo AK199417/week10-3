@@ -1,20 +1,24 @@
 resource "azurerm_kubernetes_cluster" "aks" {
-  name                = local.aks_name_eff
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  dns_prefix          = "dns-${local.base}"
-
-  identity { type = "SystemAssigned" }
+  name                = var.aks_name
+  resource_group_name = data.azurerm_resource_group.rg.name
+  location            = data.azurerm_resource_group.rg.location
+  dns_prefix          = "${var.app_name}-${var.env}"
 
   default_node_pool {
-    name       = "sysnp"
+    name       = "system"
     node_count = var.aks_node_count
     vm_size    = var.aks_node_size
+    type       = "VirtualMachineScaleSets"
   }
 
-  oms_agent {
-    log_analytics_workspace_id = azurerm_log_analytics_workspace.law.id
+  identity {
+    type = "SystemAssigned"
   }
 
-  tags = merge({ env = var.env, app = var.app_name }, var.tags)
+  network_profile {
+    network_plugin    = "azure"
+    load_balancer_sku = "standard"
+  }
+
+  tags = merge(var.tags, { env = var.env, app = var.app_name })
 }
