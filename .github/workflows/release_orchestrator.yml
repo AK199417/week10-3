@@ -1,0 +1,390 @@
+name: Orchestrator - CI to Dev and Prod (Import-or-Create Infra)
+
+on:
+  push:
+    branches: [ dev ]
+  pull_request:
+    branches: [ main ]
+    types: [ closed ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: dev-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: ecom
+
+jobs:
+  # ===================== DEV =====================
+  infra_dev:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    outputs:
+      dev_acr: ${{ steps.tfout.outputs.acr }}
+      dev_aks_name: ${{ steps.tfout.outputs.aks }}
+      dev_aks_rg: ${{ steps.tfout.outputs.rg }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init (DEV)
+        working-directory: infra
+        run: terraform init
+
+      - name: Import existing ACR if present (DEV)
+        working-directory: infra
+        env:
+          ACR_NAME: devacr
+        run: |
+          set -euo pipefail
+          if az acr show -n "$ACR_NAME" >/dev/null 2>&1; then
+            ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
+            terraform state show azurerm_container_registry.acr >/dev/null 2>&1 || terraform import azurerm_container_registry.acr "$ACR_ID"
+            echo "Imported existing ACR: $ACR_ID"
+          else
+            echo "ACR $ACR_NAME not found; Terraform will create it."
+          fi
+
+      - name: Import existing AKS if present (DEV)
+        working-directory: infra
+        env:
+          RG_NAME: rg-ecom-dev
+          AKS_NAME: devaks
+        run: |
+          set -euo pipefail
+          if az aks show -g "$RG_NAME" -n "$AKS_NAME" >/dev/null 2>&1; then
+            AKS_ID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query id -o tsv)
+            terraform state show azurerm_kubernetes_cluster.aks >/dev/null 2>&1 || terraform import azurerm_kubernetes_cluster.aks "$AKS_ID"
+            echo "Imported existing AKS: $AKS_ID"
+          else
+            echo "AKS $AKS_NAME not found; Terraform will create it."
+          fi
+
+      - name: Terraform apply (DEV)
+        working-directory: infra
+        run: |
+          SUB_ID=$(az account show --query id -o tsv)
+          terraform apply -auto-approve -var="subscription_id=$SUB_ID" -var-file=envs/dev.tfvars
+
+      - name: Ensure RBAC AKS can pull from ACR (DEV)
+        env:
+          RG_NAME: rg-ecom-dev
+          ACR_NAME: devacr
+          AKS_NAME: devaks
+        run: |
+          set -euo pipefail
+          ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
+          OID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query "identityProfile.kubeletidentity.objectId" -o tsv 2>/dev/null || true)
+          if [ -z "$OID" ]; then
+            OID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query "identity.principalId" -o tsv)
+          fi
+          az role assignment create --assignee "$OID" --role "AcrPull" --scope "$ACR_ID" >/dev/null 2>&1 || echo "AcrPull already assigned"
+
+      - name: Install jq (for parsing TF outputs)
+        run: |
+          if ! command -v jq >/dev/null 2%; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
+      - name: Capture Terraform outputs (DEV)
+        id: tfout
+        working-directory: infra
+        run: |
+          OUT=$(terraform output -json)
+          echo "acr=$(echo "$OUT" | jq -r '.acr_login_server.value')" >> "$GITHUB_OUTPUT"
+          echo "aks=$(echo "$OUT" | jq -r '.aks_name.value')"         >> "$GITHUB_OUTPUT"
+          echo "rg=$(echo "$OUT"  | jq -r '.aks_rg.value')"           >> "$GITHUB_OUTPUT"
+
+  backend_ci:
+    if: ${{ github.event_name == 'push' }}
+    needs: infra_dev
+    uses: ./.github/workflows/backend_ci.yml
+    secrets: inherit
+
+  frontend_ci:
+    if: ${{ github.event_name == 'push' }}
+    needs: [infra_dev, backend_ci]
+    uses: ./.github/workflows/frontend_ci.yml
+    secrets: inherit
+
+  set_aks_context_dev:
+    if: ${{ github.event_name == 'push' }}
+    needs: [infra_dev, backend_ci, frontend_ci]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Set AKS kubecontext (DEV)
+        run: az aks get-credentials -n "${{ needs.infra_dev.outputs.dev_aks_name }}" -g "${{ needs.infra_dev.outputs.dev_aks_rg }}" --overwrite-existing
+
+  backend_cd_dev:
+    if: ${{ github.event_name == 'push' }}
+    needs: set_aks_context_dev
+    uses: ./.github/workflows/backend-cd.yml
+    with:
+      k8s_namespace: dev
+    secrets: inherit
+
+  frontend_cd_dev:
+    if: ${{ github.event_name == 'push' }}
+    needs: backend_cd_dev
+    uses: ./.github/workflows/frontend-cd.yml
+    with:
+      k8s_namespace: dev
+      product_api_ip:  "http://${{ needs.backend_cd_dev.outputs.product_api_ip }}:8000"
+      order_api_ip:    "http://${{ needs.backend_cd_dev.outputs.order_api_ip }}:8001"
+      customer_api_ip: "http://${{ needs.backend_cd_dev.outputs.customer_api_ip }}:8002"
+    secrets: inherit
+
+  smoke_test_dev:
+    if: ${{ github.event_name == 'push' }}
+    needs: frontend_cd_dev
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Set AKS context
+        run: az aks get-credentials -n "${{ needs.infra_dev.outputs.dev_aks_name }}" -g "${{ needs.infra_dev.outputs.dev_aks_rg }}" --overwrite-existing
+      - name: Smoke test frontend
+        env:
+          NS: dev
+        run: |
+          IP=$(kubectl -n "$NS" get svc frontend-w05-aks -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Frontend IP: $IP"
+          curl -fsS "http://$IP" >/dev/null
+
+  # ===================== PROD =====================
+  infra_prod:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }}
+    runs-on: ubuntu-latest
+    outputs:
+      prod_acr: ${{ steps.tfout.outputs.acr }}
+      prod_aks_name: ${{ steps.tfout.outputs.aks }}
+      prod_aks_rg: ${{ steps.tfout.outputs.rg }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform init (PROD)
+        working-directory: infra
+        run: terraform init
+
+      - name: Import existing ACR if present (PROD)
+        working-directory: infra
+        env:
+          ACR_NAME: prodacr
+        run: |
+          set -euo pipefail
+          if az acr show -n "$ACR_NAME" >/dev/null 2>&1; then
+            ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
+            terraform state show azurerm_container_registry.acr >/dev/null 2>&1 || terraform import azurerm_container_registry.acr "$ACR_ID"
+            echo "Imported existing ACR: $ACR_ID"
+          else
+            echo "ACR $ACR_NAME not found; Terraform will create it."
+          fi
+
+      - name: Import existing AKS if present (PROD)
+        working-directory: infra
+        env:
+          RG_NAME: rg-ecom-prod
+          AKS_NAME: prodaks
+        run: |
+          set -euo pipefail
+          if az aks show -g "$RG_NAME" -n "$AKS_NAME" >/dev/null 2>&1; then
+            AKS_ID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query id -o tsv)
+            terraform state show azurerm_kubernetes_cluster.aks >/dev/null 2>&1 || terraform import azurerm_kubernetes_cluster.aks "$AKS_ID"
+            echo "Imported existing AKS: $AKS_ID"
+          else
+            echo "AKS $AKS_NAME not found; Terraform will create it."
+          fi
+
+      - name: Terraform apply (PROD)
+        working-directory: infra
+        run: |
+          SUB_ID=$(az account show --query id -o tsv)
+          terraform apply -auto-approve -var="subscription_id=$SUB_ID" -var-file=envs/prod.tfvars
+
+      - name: Ensure RBAC AKS can pull from ACR (PROD)
+        env:
+          RG_NAME: rg-ecom-prod
+          ACR_NAME: prodacr
+          AKS_NAME: prodaks
+        run: |
+          set -euo pipefail
+          ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
+          OID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query "identityProfile.kubeletidentity.objectId" -o tsv 2>/dev/null || true)
+          if [ -z "$OID" ]; then
+            OID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query "identity.principalId" -o tsv)
+          fi
+          az role assignment create --assignee "$OID" --role "AcrPull" --scope "$ACR_ID" >/dev/null 2>&1 || echo "AcrPull already assigned"
+
+      - name: Install jq (for parsing TF outputs)
+        run: |
+          if ! command -v jq >/dev/null 2%; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
+      - name: Capture Terraform outputs (PROD)
+        id: tfout
+        working-directory: infra
+        run: |
+          OUT=$(terraform output -json)
+          echo "acr=$(echo "$OUT" | jq -r '.acr_login_server.value')" >> "$GITHUB_OUTPUT"
+          echo "aks=$(echo "$OUT" | jq -r '.aks_name.value')"         >> "$GITHUB_OUTPUT"
+          echo "rg=$(echo "$OUT"  | jq -r '.aks_rg.value')"           >> "$GITHUB_OUTPUT"
+
+  promote_images_prod:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }}
+    needs: infra_prod
+    runs-on: ubuntu-latest
+    outputs:
+      tag:                 ${{ steps.meta.outputs.tag }}
+      d_product_service:   ${{ steps.meta.outputs.d_prod }}
+      d_order_service:     ${{ steps.meta.outputs.d_ordr }}
+      d_customer_service:  ${{ steps.meta.outputs.d_cust }}
+      d_frontend:          ${{ steps.meta.outputs.d_front }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Collect digests from DEV and import into PROD
+        id: meta
+        env:
+          PROD_ACR_LOGIN:    ${{ needs.infra_prod.outputs.prod_acr }}
+          DEV_ACR_LOGIN_VAR: ${{ vars.AZURE_CONTAINER_REGISTRY }}
+        run: |
+          set -euo pipefail
+          PR_SHA="${{ github.event.pull_request.head.sha }}"
+          TAG="${PR_SHA:0:7}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using TAG=$TAG"
+
+          DEV_ACR_LOGIN="$DEV_ACR_LOGIN_VAR"
+          DEV_ACR_NAME="${DEV_ACR_LOGIN%%.*}"
+          echo "Dev ACR: $DEV_ACR_LOGIN"
+
+          repo_prod=product_service
+          repo_ordr=order_service
+          repo_cust=customer_service
+          repo_front=frontend
+
+          get_digest () {
+            local repo="$1"
+            az acr repository show-manifests -n "$DEV_ACR_NAME" --repository "$repo" --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv
+          }
+
+          D_PROD=$(get_digest "$repo_prod");   D_PROD=${D_PROD#sha256:}
+          D_ORDR=$(get_digest "$repo_ordr");   D_ORDR=${D_ORDR#sha256:}
+          D_CUST=$(get_digest "$repo_cust");   D_CUST=${D_CUST#sha256:}
+          D_FRONT=$(get_digest "$repo_front"); D_FRONT=${D_FRONT#sha256:}
+
+          test -n "$D_PROD"  || { echo "No digest for $repo_prod:$TAG";  exit 1; }
+          test -n "$D_ORDR"  || { echo "No digest for $repo_ordr:$TAG";  exit 1; }
+          test -n "$D_CUST"  || { echo "No digest for $repo_cust:$TAG";  exit 1; }
+          test -n "$D_FRONT" || { echo "No digest for $repo_front:$TAG"; exit 1; }
+
+          echo "d_prod=$D_PROD"   >> "$GITHUB_OUTPUT"
+          echo "d_ordr=$D_ORDR"   >> "$GITHUB_OUTPUT"
+          echo "d_cust=$D_CUST"   >> "$GITHUB_OUTPUT"
+          echo "d_front=$D_FRONT" >> "$GITHUB_OUTPUT"
+
+          DST_LOGIN="$PROD_ACR_LOGIN"
+          DST_NAME="${DST_LOGIN%%.*}"
+          az acr import --name "$DST_NAME" --source "$DEV_ACR_LOGIN/$repo_prod@sha256:$D_PROD"   --image $repo_prod:$TAG
+          az acr import --name "$DST_NAME" --source "$DEV_ACR_LOGIN/$repo_ordr@sha256:$D_ORDR"   --image $repo_ordr:$TAG
+          az acr import --name "$DST_NAME" --source "$DEV_ACR_LOGIN/$repo_cust@sha256:$D_CUST"   --image $repo_cust:$TAG
+          az acr import --name "$DST_NAME" --source "$DEV_ACR_LOGIN/$repo_front@sha256:$D_FRONT" --image $repo_front:$TAG
+
+  set_aks_context_prod:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }}
+    needs: [infra_prod, promote_images_prod]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Set AKS kubecontext (PROD)
+        run: az aks get-credentials -n "${{ needs.infra_prod.outputs.prod_aks_name }}" -g "${{ needs.infra_prod.outputs.prod_aks_rg }}" --overwrite-existing
+
+  backend_cd_prod:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }}
+    needs: set_aks_context_prod
+    uses: ./.github/workflows/backend-cd.yml
+    with:
+      k8s_namespace: ecommerce
+    secrets: inherit
+
+  pin_backend_prod:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }}
+    needs: [infra_prod, promote_images_prod, backend_cd_prod]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        run: az aks get-credentials -n "${{ needs.infra_prod.outputs.prod_aks_name }}" -g "${{ needs.infra_prod.outputs.prod_aks_rg }}" --overwrite-existing
+
+      - name: Install jq (for JSON patch helper)
+        run: |
+          if ! command -v jq >/dev/null 2%; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
+      - name: Pin backend images by digest
+        env:
+          NS: ecommerce
+          PROD_ACR: ${{ needs.infra_prod.outputs.prod_acr }}
+          D_PROD: ${{ needs.promote_images_prod.outputs.d_product_service }}
+          D_ORDR: ${{ needs.promote_images_prod.outputs.d_order_service }}
+          D_CUST: ${{ needs.promote_images_prod.outputs.d_customer_service }}
+        run: |
+          set -euo pipefail
+          repos=( "product_service:$D_PROD" "order_service:$D_ORDR" "customer_service:$D_CUST" )
+          for pair in "${repos[@]}"; do
+            repo="${pair%%:*}"; digest="${pair##*:}"
+            img="$PROD_ACR/$repo@sha256:$digest"
+            for dep in $(kubectl -n "$NS" get deploy -o jsonpath='{.items[*].metadata.name}'); do
+              idxs=$(kubectl -n "$NS" get deploy "$dep" -o json | jq -r --arg REPO "$PROD_ACR/$repo" '[ .spec.template.spec.containers | to_entries[] | select(.value.image | startswith($REPO)) | .key ] | @sh')
+              eval "arr=$idxs"
+              for i in "${arr[@]}"; do
+                patch='[{"op":"replace","path":"/spec/template/spec/containers/'"$i"'/image","value":"'"$img"'"}]'
+                kubectl -n "$NS" patch deploy "$dep" --type='json' -p "$patch"
+                echo "Pinned $dep container[$i] -> $img"
+              done
+            done
+          done
+          for dep in $(kubectl -n "$NS" get deploy -o jsonpath='{.items[*].metadata.name}'); do
+            kubectl -n "$NS" rollout status deploy/"$dep" --timeout=300s || exit 1
+          done
+
+  frontend_cd_prod:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }}
+    needs: [backend_cd_prod, promote_images_prod]
+    uses: ./.github/workflows/frontend-cd.yml
+    with:
+      k8s_namespace: ecommerce
+      product_api_ip:  "http://${{ needs.backend_cd_prod.outputs.product_api_ip }}:8000"
+      order_api_ip:    "http://${{ needs.backend_cd_prod.outputs.order_api_ip }}:8001"
+      customer_api_ip: "http://${{ needs.backend_cd_prod.outputs.customer_api_ip }}:8002"
+      frontend_tag:    ${{ needs.promote_images_prod.outputs.tag }}
+    secrets: inherit

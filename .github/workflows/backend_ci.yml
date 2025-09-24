@@ -1,0 +1,207 @@
+name: Backend CI - Test, Build and Push Images to ACR
+
+on:
+  workflow_call: {}
+  pull_request:
+    branches: [ main, dev, develop ]
+
+env:
+  ACR_LOGIN_SERVER: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+
+jobs:
+  test_and_lint_backends:
+    runs-on: ubuntu-latest
+
+    services:
+      product_db:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: products
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - "5432:5432"
+
+      order_db:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: orders
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - "5433:5432"
+
+      customer_db:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: customers
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - "5434:5432"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          for req in backend/*/requirements.txt; do
+            echo "Installing $req"
+            pip install -r "$req"
+          done
+          pip install pytest httpx
+
+      - name: Run product_service tests
+        working-directory: backend/product_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: products
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: pytest tests --maxfail=1 --disable-warnings -q
+
+      - name: Run order_service tests
+        working-directory: backend/order_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5433
+          POSTGRES_DB: orders
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: pytest tests --maxfail=1 --disable-warnings -q
+
+      - name: Run customer_service tests
+        working-directory: backend/customer_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5434
+          POSTGRES_DB: customers
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: pytest tests --maxfail=1 --disable-warnings -q
+
+  build_and_push_images:
+    runs-on: ubuntu-latest
+    needs: test_and_lint_backends
+    if: ${{ needs.test_and_lint_backends.result == 'success' && github.event_name != 'pull_request' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Derive ACR name and SHORT_SHA
+        run: |
+          echo "ACR_NAME=${ACR_LOGIN_SERVER%%.*}" >> $GITHUB_ENV
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Login to Azure Container Registry
+        run: az acr login --name "${{ env.ACR_NAME }}"
+
+      # ----- build or skip if tag already exists -----
+      - name: Build & Push product_service (idempotent)
+        run: |
+          set -euo pipefail
+          TAG="$SHORT_SHA"
+          REPO="product_service"
+          EXIST_DIGEST=$(az acr repository show-manifests -n "$ACR_NAME" --repository "$REPO" \
+            --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
+          if [ -n "$EXIST_DIGEST" ]; then
+            echo "SKIP: $REPO:$TAG already exists ($EXIST_DIGEST)"
+          else
+            docker build -t $ACR_LOGIN_SERVER/$REPO:latest -t $ACR_LOGIN_SERVER/$REPO:$TAG ./backend/product_service/
+            docker push  $ACR_LOGIN_SERVER/$REPO:latest
+            docker push  $ACR_LOGIN_SERVER/$REPO:$TAG
+          fi
+
+      - name: Build & Push order_service (idempotent)
+        run: |
+          set -euo pipefail
+          TAG="$SHORT_SHA"
+          REPO="order_service"
+          EXIST_DIGEST=$(az acr repository show-manifests -n "$ACR_NAME" --repository "$REPO" \
+            --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
+          if [ -n "$EXIST_DIGEST" ]; then
+            echo "SKIP: $REPO:$TAG already exists ($EXIST_DIGEST)"
+          else
+            docker build -t $ACR_LOGIN_SERVER/$REPO:latest -t $ACR_LOGIN_SERVER/$REPO:$TAG ./backend/order_service/
+            docker push  $ACR_LOGIN_SERVER/$REPO:latest
+            docker push  $ACR_LOGIN_SERVER/$REPO:$TAG
+          fi
+
+      - name: Build & Push customer_service (idempotent)
+        run: |
+          set -euo pipefail
+          TAG="$SHORT_SHA"
+          REPO="customer_service"
+          EXIST_DIGEST=$(az acr repository show-manifests -n "$ACR_NAME" --repository "$REPO" \
+            --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
+          if [ -n "$EXIST_DIGEST" ]; then
+            echo "SKIP: $REPO:$TAG already exists ($EXIST_DIGEST)"
+          else
+            docker build -t $ACR_LOGIN_SERVER/$REPO:latest -t $ACR_LOGIN_SERVER/$REPO:$TAG ./backend/customer_service/
+            docker push  $ACR_LOGIN_SERVER/$REPO:latest
+            docker push  $ACR_LOGIN_SERVER/$REPO:$TAG
+          fi
+
+      - name: Ensure jq
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y jq
+          fi
+
+      # ----- capture immutable digests for this tag -----
+      - name: Capture digests and upload release metadata
+        run: |
+          set -euo pipefail
+          TAG="$SHORT_SHA"
+          D_PROD=$(az acr repository show-manifests -n "$ACR_NAME" --repository product_service   --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
+          D_ORDR=$(az acr repository show-manifests -n "$ACR_NAME" --repository order_service     --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
+          D_CUST=$(az acr repository show-manifests -n "$ACR_NAME" --repository customer_service  --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
+
+          mkdir -p _deploy
+          jq -n --arg tag "$TAG" \
+                --arg d_prod "$D_PROD" \
+                --arg d_ordr "$D_ORDR" \
+                --arg d_cust "$D_CUST" \
+                '{tag:$tag, product_service:$d_prod, order_service:$d_ordr, customer_service:$d_cust}' \
+            > _deploy/backend-release.json
+
+          echo "Generated _deploy/backend-release.json:"
+          cat _deploy/backend-release.json
+
+      - name: Upload backend release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-release
+          path: _deploy/backend-release.json
+
+      - name: Logout Azure
+        if: always()
+        run: az logout
