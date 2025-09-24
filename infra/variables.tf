@@ -4,11 +4,6 @@ variable "subscription_id" {
   default     = ""
 }
 
-variable "location" {
-  type    = string
-  default = "australiaeast"
-}
-
 variable "env" {
   description = "Environment name: dev | prod"
   type        = string
@@ -19,15 +14,19 @@ variable "app_name" {
   default = "ecom"
 }
 
-# Explicit names (so you can get devacr/prodacr, devaks/prodaks)
+# 🔹 Use an existing RG by name
+variable "resource_group_name" {
+  description = "Name of an existing Azure Resource Group to deploy into"
+  type        = string
+}
+
+# Explicit names so you get devacr/prodacr, devaks/prodaks
 variable "acr_name" {
-  type    = string
-  default = ""
+  type = string
 }
 
 variable "aks_name" {
-  type    = string
-  default = ""
+  type = string
 }
 
 # AKS sizing

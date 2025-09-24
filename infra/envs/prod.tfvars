@@ -1,14 +1,12 @@
-env      = "prod"
-app_name = "ecom"
-location = "australiaeast"
+# PROD also uses existing RG: deakinuni
+env                 = "prod"
+resource_group_name = "deakinuni"
 
-acr_name = "prodacr"
-aks_name = "prodaks"
-
-aks_node_count = 3
-aks_node_size  = "Standard_D4s_v5"
+acr_name       = "prodacr"
+aks_name       = "prodaks"
+aks_node_count = 2
 
 tags = {
-  owner = "AK"
-  stage = "prod"
+  owner = "you"
+  env   = "prod"
 }

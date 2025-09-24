@@ -1,15 +1,14 @@
-env      = "dev"
-app_name = "ecom"
-location = "australiaeast"
+# DEV uses existing RG: deakinuni
+env                 = "dev"
+resource_group_name = "deakinuni"
 
-# explicit names
-acr_name = "devacr"
-aks_name = "devaks"
+# keep your own names if you like
+acr_name       = "devacr"
+aks_name       = "devaks"
+aks_node_count = 1
 
-aks_node_count = 2
-aks_node_size  = "Standard_B4ms"
-
+# optional tags
 tags = {
-  owner = "AK"
-  stage = "dev"
+  owner = "you"
+  env   = "dev"
 }
