@@ -4,19 +4,19 @@ on:
   workflow_call:
     inputs:
       product_api_ip:
-        description: Product API URL (e.g., http://X.X.X.X:8000)
+        description: Product API URL (http://X.X.X.X:8000)
         required: true
         type: string
       order_api_ip:
-        description: Order API URL (e.g., http://Y.Y.Y.Y:8001)
+        description: Order API URL (http://Y.Y.Y.Y:8001)
         required: true
         type: string
       customer_api_ip:
-        description: Customer API URL (e.g., http://Z.Z.Z.Z:8002)
+        description: Customer API URL (http://Z.Z.Z.Z:8002)
         required: true
         type: string
       k8s_namespace:
-        required: false
+        required: true
         type: string
       aks_cluster_name:
         required: false
@@ -25,33 +25,30 @@ on:
         required: false
         type: string
       frontend_tag:
-        description: "If set, deploy this tag (skips build)"
-        required: false
-        type: string
-      frontend_digest:
-        description: "If set, pin by digest (skips build), format sha256:XXXX"
         required: false
         type: string
       build_in_cd:
-        description: "true to build in CD (used when you must inject URLs at build)"
         required: false
         type: boolean
         default: false
-  workflow_dispatch: {}
+      acr_login_server:
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 env:
-  ACR_LOGIN_SERVER: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
-  K8S_NAMESPACE: ecommerce
+  K8S_NAMESPACE: ${{ inputs.k8s_namespace }}
   FRONTEND_DEPLOY: frontend-w05-aks
   FRONTEND_CONTAINER: frontend-container
+  ACR_LOGIN_SERVER: ${{ inputs.acr_login_server }}
 
 jobs:
   deploy_frontend:
     runs-on: ubuntu-latest
-    # Use your own environments as you prefer; leaving out hard-coded "Production" here
+    environment: Production
+
     steps:
       - uses: actions/checkout@v4
 
@@ -60,10 +57,8 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Resolve AKS, namespace, and desired image ref
-        id: resolve
+      - name: Resolve AKS and tag
         run: |
-          # Resolve AKS details
           AKS_RG="${{ inputs.aks_resource_group }}"
           [ -z "$AKS_RG" ] && AKS_RG="${{ secrets.AKS_RESOURCE_GROUP }}"
           echo "AKS_RG=$AKS_RG" >> $GITHUB_ENV
@@ -72,24 +67,11 @@ jobs:
           [ -z "$AKS_NAME" ] && AKS_NAME="${{ secrets.AKS_CLUSTER_NAME }}"
           echo "AKS_NAME=$AKS_NAME" >> $GITHUB_ENV
 
-          NS_IN="${{ inputs.k8s_namespace }}"
-          [ -z "$NS_IN" ] && NS_IN="${{ env.K8S_NAMESPACE }}"
-          echo "K8S_NAMESPACE_RESOLVED=$NS_IN" >> $GITHUB_ENV
+          TAG="${{ inputs.frontend_tag }}"
+          [ -z "$TAG" ] && TAG="latest"
+          echo "FRONTEND_TAG=$TAG" >> $GITHUB_ENV
 
-          # Decide image reference (digest > tag > default SHORT_SHA)
-          ACR="${{ env.ACR_LOGIN_SERVER }}"
-          if [ -n "${{ inputs.frontend_digest }}" ]; then
-            echo "IMG_REF=$ACR/frontend@${{ inputs.frontend_digest }}" >> $GITHUB_ENV
-            echo "MODE=deploy_digest" >> $GITHUB_ENV
-          elif [ -n "${{ inputs.frontend_tag }}" ]; then
-            echo "IMG_REF=$ACR/frontend:${{ inputs.frontend_tag }}" >> $GITHUB_ENV
-            echo "MODE=deploy_tag" >> $GITHUB_ENV
-          else
-            # default to the commit that triggered this call
-            SHORT_SHA="${GITHUB_SHA::7}"
-            echo "IMG_REF=$ACR/frontend:${SHORT_SHA}" >> $GITHUB_ENV
-            echo "MODE=deploy_tag" >> $GITHUB_ENV
-          fi
+          echo "ACR_NAME=${ACR_LOGIN_SERVER%%.*}" >> $GITHUB_ENV
 
       - name: Set AKS context
         run: |
@@ -97,44 +79,27 @@ jobs:
           kubectl cluster-info
 
       - name: Ensure namespace exists
-        run: |
-          kubectl get ns "$K8S_NAMESPACE_RESOLVED" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE_RESOLVED"
+        run: kubectl get ns "$K8S_NAMESPACE" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE"
 
-      # ---------- Optional build path (Dev use-case) ----------
-      - name: (Optional) Inject backend URLs & Build+Push
-        if: ${{ inputs.build_in_cd == true }}
+      - name: Inject backend URLs into main.js
         run: |
-          set -euo pipefail
-          # inject URLs into source, then build & push a fresh image (tag stays the same as IMG_REF if it's a tag)
           sed -i "s|_PRODUCT_API_URL_|${{ inputs.product_api_ip }}|g"   frontend/main.js
           sed -i "s|_ORDER_API_URL_|${{ inputs.order_api_ip }}|g"       frontend/main.js
           sed -i "s|_CUSTOMER_API_URL_|${{ inputs.customer_api_ip }}|g" frontend/main.js
 
-          ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
-          az acr login --name "$ACR_NAME"
-
-          # If IMG_REF is digest we can't push to a digest; so when build_in_cd=true we force a tag
-          if [[ "$IMG_REF" == *@sha256:* ]]; then
-            TAG="${GITHUB_SHA::7}"
-            IMG_REF="$ACR_LOGIN_SERVER/frontend:${TAG}"
-            echo "IMG_REF=$IMG_REF" >> $GITHUB_ENV
-          fi
-
-          docker build -t "$IMG_REF" ./frontend/
-          docker push  "$IMG_REF"
-
-      # ---------- Apply k8s and bump to desired image (tag or digest) ----------
-      - name: Apply manifests
-        run: kubectl apply -n "$K8S_NAMESPACE_RESOLVED" -f k8s/frontend.yaml
-
-      - name: Set image and rollout
-        shell: bash
+      - name: Optional build & push in CD
+        if: ${{ inputs.build_in_cd == true }}
         run: |
-          set -euo pipefail
-          kubectl -n "$K8S_NAMESPACE_RESOLVED" set image deploy/${{ env.FRONTEND_DEPLOY }} \
-            ${{ env.FRONTEND_CONTAINER }}="$IMG_REF" --record
-          kubectl -n "$K8S_NAMESPACE_RESOLVED" rollout status deploy/${{ env.FRONTEND_DEPLOY }} --timeout=300s
+          az acr login --name "$ACR_NAME"
+          docker build -t ${ACR_LOGIN_SERVER}/frontend:${FRONTEND_TAG} ./frontend/
+          docker push  ${ACR_LOGIN_SERVER}/frontend:${FRONTEND_TAG}
 
-      - name: Logout Azure
-        if: always()
-        run: az logout
+      - name: Apply manifests
+        run: kubectl apply -n "$K8S_NAMESPACE" -f k8s/frontend.yaml
+
+      - name: Set image & rollout
+        run: |
+          kubectl -n "$K8S_NAMESPACE" set image deploy/${{ env.FRONTEND_DEPLOY }} \
+            ${{ env.FRONTEND_CONTAINER }}=${ACR_LOGIN_SERVER}/frontend:${FRONTEND_TAG}
+          kubectl -n "$K8S_NAMESPACE" rollout restart deploy/${{ env.FRONTEND_DEPLOY }}
+          kubectl -n "$K8S_NAMESPACE" rollout status  deploy/${{ env.FRONTEND_DEPLOY }} --timeout=300s

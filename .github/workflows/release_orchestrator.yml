@@ -17,6 +17,12 @@ permissions:
 
 env:
   APP_NAME: ecom
+  DEV_RG: deakinuni
+  DEV_ACR_NAME: akdevacr
+  DEV_AKS_NAME: akdevaks
+  PROD_RG: deakinuni
+  PROD_ACR_NAME: akprodacr
+  PROD_AKS_NAME: akprodaks
 
 jobs:
   # ===================== DEV =====================
@@ -45,54 +51,46 @@ jobs:
       - name: Import existing ACR if present (DEV)
         working-directory: infra
         env:
-          # Provide required variables to Terraform during import
           TF_VAR_env: dev
-          TF_VAR_resource_group_name: deakinuni
-          TF_VAR_acr_name: akdevacr
-          TF_VAR_aks_name: akdevaks
-          ACR_NAME: akdevacr
+          TF_VAR_resource_group_name: ${{ env.DEV_RG }}
+          TF_VAR_acr_name: ${{ env.DEV_ACR_NAME }}
+          TF_VAR_aks_name: ${{ env.DEV_AKS_NAME }}
+          ACR_NAME: ${{ env.DEV_ACR_NAME }}
         run: |
           set -Eeuo pipefail
           SUB_ID=$(az account show --query id -o tsv)
-
-          echo "Fast global check for ACR name availability..."
           if az acr check-name -n "$ACR_NAME" -o tsv --query nameAvailable | grep -qi true; then
-            echo "ACR '$ACR_NAME' is available (does not exist). Skipping import; Terraform will create it."
-            exit 0
-          fi
-
-          echo "Name is taken; checking if it exists in THIS subscription for import..."
-          if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
-            ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
-            terraform state list | grep -q '^azurerm_container_registry\.acr$' \
-              || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
-            echo "Imported existing ACR: $ACR_ID"
+            echo "ACR '$ACR_NAME' does not exist. Skip import."
           else
-            echo "ACR '$ACR_NAME' is not in this subscription or not accessible; Terraform will try to create it."
+            if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
+              ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
+              terraform state list | grep -q '^azurerm_container_registry\.acr$' \
+                || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
+              echo "Imported ACR: $ACR_ID"
+            else
+              echo "ACR exists but not accessible; TF will try to create (will fail if name global-taken)."
+            fi
           fi
 
       - name: Import existing AKS if present (DEV)
         working-directory: infra
         env:
           TF_VAR_env: dev
-          TF_VAR_resource_group_name: deakinuni
-          TF_VAR_acr_name: akdevacr
-          TF_VAR_aks_name: akdevaks
-          RG_NAME: deakinuni
-          AKS_NAME: akdevaks
+          TF_VAR_resource_group_name: ${{ env.DEV_RG }}
+          TF_VAR_acr_name: ${{ env.DEV_ACR_NAME }}
+          TF_VAR_aks_name: ${{ env.DEV_AKS_NAME }}
+          RG_NAME: ${{ env.DEV_RG }}
+          AKS_NAME: ${{ env.DEV_AKS_NAME }}
         run: |
           set -Eeuo pipefail
           SUB_ID=$(az account show --query id -o tsv)
-
-          # Quick existence check
           if timeout 20s az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
-            # Build a properly-cased resource ID to satisfy Terraform's parser
             AKS_ID="/subscriptions/${SUB_ID}/resourceGroups/${RG_NAME}/providers/Microsoft.ContainerService/managedClusters/${AKS_NAME}"
             terraform state list | grep -q '^azurerm_kubernetes_cluster\.aks$' \
               || terraform import -input=false azurerm_kubernetes_cluster.aks "$AKS_ID"
-            echo "Imported existing AKS: $AKS_ID"
+            echo "Imported AKS: $AKS_ID"
           else
-            echo "AKS $AKS_NAME not found; Terraform will create it."
+            echo "AKS not found; TF will create."
           fi
 
       - name: Terraform apply (DEV)
@@ -103,9 +101,9 @@ jobs:
 
       - name: Ensure RBAC AKS can pull from ACR (DEV)
         env:
-          RG_NAME: deakinuni
-          ACR_NAME: akdevacr
-          AKS_NAME: akdevaks
+          RG_NAME: ${{ env.DEV_RG }}
+          ACR_NAME: ${{ env.DEV_ACR_NAME }}
+          AKS_NAME: ${{ env.DEV_AKS_NAME }}
         run: |
           set -Eeuo pipefail
           ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
@@ -113,9 +111,19 @@ jobs:
           if [ -z "$OID" ]; then
             OID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query "identity.principalId" -o tsv)
           fi
-          az role assignment create --assignee "$OID" --role "AcrPull" --scope "$ACR_ID" >/dev/null 2>&1 || echo "AcrPull already assigned"
+          az role assignment create --assignee "$OID" --role "AcrPull" --scope "$ACR_ID" >/dev/null 2>&1 || true
 
-      - name: Install jq (for parsing TF outputs)
+      - name: Ensure CI has ACR roles (DEV)
+        env:
+          ACR_NAME: ${{ env.DEV_ACR_NAME }}
+          SPN_CLIENT_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+        run: |
+          set -Eeuo pipefail
+          ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
+          az role assignment create --assignee "$SPN_CLIENT_ID" --role "AcrPush" --scope "$ACR_ID" >/dev/null 2>&1 || true
+          az role assignment create --assignee "$SPN_CLIENT_ID" --role "AcrPull" --scope "$ACR_ID" >/dev/null 2>&1 || true
+
+      - name: Install jq
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y jq
@@ -134,12 +142,16 @@ jobs:
     if: ${{ github.event_name == 'push' }}
     needs: infra_dev
     uses: ./.github/workflows/backend_ci.yml
+    with:
+      acr_login_server: ${{ needs.infra_dev.outputs.dev_acr }}
     secrets: inherit
 
   frontend_ci:
     if: ${{ github.event_name == 'push' }}
     needs: [infra_dev, backend_ci]
     uses: ./.github/workflows/frontend_ci.yml
+    with:
+      acr_login_server: ${{ needs.infra_dev.outputs.dev_acr }}
     secrets: inherit
 
   set_aks_context_dev:
@@ -159,6 +171,7 @@ jobs:
     uses: ./.github/workflows/backend-cd.yml
     with:
       k8s_namespace: dev
+      acr_login_server: ${{ needs.infra_dev.outputs.dev_acr }}
     secrets: inherit
 
   frontend_cd_dev:
@@ -167,9 +180,11 @@ jobs:
     uses: ./.github/workflows/frontend-cd.yml
     with:
       k8s_namespace: dev
+      acr_login_server: ${{ needs.infra_dev.outputs.dev_acr }}
       product_api_ip:  "http://${{ needs.backend_cd_dev.outputs.product_api_ip }}:8000"
       order_api_ip:    "http://${{ needs.backend_cd_dev.outputs.order_api_ip }}:8001"
       customer_api_ip: "http://${{ needs.backend_cd_dev.outputs.customer_api_ip }}:8002"
+      build_in_cd: true
     secrets: inherit
 
   smoke_test_dev:
@@ -212,50 +227,45 @@ jobs:
         working-directory: infra
         env:
           TF_VAR_env: prod
-          TF_VAR_resource_group_name: deakinuni
-          TF_VAR_acr_name: akprodacr
-          TF_VAR_aks_name: akprodaks
-          ACR_NAME: akprodacr
+          TF_VAR_resource_group_name: ${{ env.PROD_RG }}
+          TF_VAR_acr_name: ${{ env.PROD_ACR_NAME }}
+          TF_VAR_aks_name: ${{ env.PROD_AKS_NAME }}
+          ACR_NAME: ${{ env.PROD_ACR_NAME }}
         run: |
           set -Eeuo pipefail
           SUB_ID=$(az account show --query id -o tsv)
-
-          echo "Fast global check for ACR name availability..."
           if az acr check-name -n "$ACR_NAME" -o tsv --query nameAvailable | grep -qi true; then
-            echo "ACR '$ACR_NAME' is available (does not exist). Skipping import; Terraform will create it."
-            exit 0
-          fi
-
-          echo "Name is taken; checking if it exists in THIS subscription for import..."
-          if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
-            ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
-            terraform state list | grep -q '^azurerm_container_registry\.acr$' \
-              || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
-            echo "Imported existing ACR: $ACR_ID"
+            echo "ACR '$ACR_NAME' does not exist. Skip import."
           else
-            echo "ACR '$ACR_NAME' is not in this subscription or not accessible; Terraform will try to create it."
+            if timeout 20s az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
+              ACR_ID=$(az acr show -n "$ACR_NAME" --subscription "$SUB_ID" --query id -o tsv)
+              terraform state list | grep -q '^azurerm_container_registry\.acr$' \
+                || terraform import -input=false azurerm_container_registry.acr "$ACR_ID"
+              echo "Imported ACR: $ACR_ID"
+            else
+              echo "ACR exists but not accessible; TF will try to create (will fail if name global-taken)."
+            fi
           fi
 
       - name: Import existing AKS if present (PROD)
         working-directory: infra
         env:
           TF_VAR_env: prod
-          TF_VAR_resource_group_name: deakinuni
-          TF_VAR_acr_name: akprodacr
-          TF_VAR_aks_name: akprodaks
-          RG_NAME: deakinuni
-          AKS_NAME: akprodaks
+          TF_VAR_resource_group_name: ${{ env.PROD_RG }}
+          TF_VAR_acr_name: ${{ env.PROD_ACR_NAME }}
+          TF_VAR_aks_name: ${{ env.PROD_AKS_NAME }}
+          RG_NAME: ${{ env.PROD_RG }}
+          AKS_NAME: ${{ env.PROD_AKS_NAME }}
         run: |
           set -Eeuo pipefail
           SUB_ID=$(az account show --query id -o tsv)
-
           if timeout 20s az aks show -g "$RG_NAME" -n "$AKS_NAME" --subscription "$SUB_ID" --query id -o tsv >/dev/null 2>&1; then
             AKS_ID="/subscriptions/${SUB_ID}/resourceGroups/${RG_NAME}/providers/Microsoft.ContainerService/managedClusters/${AKS_NAME}"
             terraform state list | grep -q '^azurerm_kubernetes_cluster\.aks$' \
               || terraform import -input=false azurerm_kubernetes_cluster.aks "$AKS_ID"
-            echo "Imported existing AKS: $AKS_ID"
+            echo "Imported AKS: $AKS_ID"
           else
-            echo "AKS $AKS_NAME not found; Terraform will create it."
+            echo "AKS not found; TF will create."
           fi
 
       - name: Terraform apply (PROD)
@@ -266,9 +276,9 @@ jobs:
 
       - name: Ensure RBAC AKS can pull from ACR (PROD)
         env:
-          RG_NAME: deakinuni
-          ACR_NAME: akprodacr
-          AKS_NAME: akprodaks
+          RG_NAME: ${{ env.PROD_RG }}
+          ACR_NAME: ${{ env.PROD_ACR_NAME }}
+          AKS_NAME: ${{ env.PROD_AKS_NAME }}
         run: |
           set -Eeuo pipefail
           ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
@@ -276,9 +286,18 @@ jobs:
           if [ -z "$OID" ]; then
             OID=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query "identity.principalId" -o tsv)
           fi
-          az role assignment create --assignee "$OID" --role "AcrPull" --scope "$ACR_ID" >/dev/null 2>&1 || echo "AcrPull already assigned"
+          az role assignment create --assignee "$OID" --role "AcrPull" --scope "$ACR_ID" >/dev/null 2>&1 || true
 
-      - name: Install jq (for parsing TF outputs)
+      - name: Ensure CI has ACR roles (PROD)
+        env:
+          ACR_NAME: ${{ env.PROD_ACR_NAME }}
+          SPN_CLIENT_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+        run: |
+          set -Eeuo pipefail
+          ACR_ID=$(az acr show -n "$ACR_NAME" --query id -o tsv)
+          az role assignment create --assignee "$SPN_CLIENT_ID" --role "AcrPush" --scope "$ACR_ID" >/dev/null 2>&1 || true
+
+      - name: Install jq
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y jq
@@ -305,46 +324,37 @@ jobs:
       d_frontend:          ${{ steps.meta.outputs.d_front }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-
       - name: Collect digests from DEV and import into PROD
         id: meta
         env:
           PROD_ACR_LOGIN:    ${{ needs.infra_prod.outputs.prod_acr }}
-          DEV_ACR_LOGIN_VAR: ${{ vars.DEV_ACR_LOGIN_SERVER }}
+          DEV_ACR_NAME:      akdevacr
         run: |
           set -Eeuo pipefail
           PR_SHA="${{ github.event.pull_request.head.sha }}"
           TAG="${PR_SHA:0:7}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Using TAG=$TAG"
 
-          DEV_ACR_LOGIN="$DEV_ACR_LOGIN_VAR"
+          DEV_ACR_LOGIN=$(az acr show -n "$DEV_ACR_NAME" --query loginServer -o tsv)
           DEV_ACR_NAME="${DEV_ACR_LOGIN%%.*}"
-          echo "Dev ACR: $DEV_ACR_LOGIN"
 
           repo_prod=product_service
           repo_ordr=order_service
           repo_cust=customer_service
           repo_front=frontend
-
           get_digest () {
             local repo="$1"
-            az acr repository show-manifests -n "$DEV_ACR_NAME" --repository "$repo" --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv
+            az acr repository show-manifests -n "$DEV_ACR_NAME" --repository "$repo" \
+              --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv
           }
-
           D_PROD=$(get_digest "$repo_prod");   D_PROD=${D_PROD#sha256:}
           D_ORDR=$(get_digest "$repo_ordr");   D_ORDR=${D_ORDR#sha256:}
           D_CUST=$(get_digest "$repo_cust");   D_CUST=${D_CUST#sha256:}
           D_FRONT=$(get_digest "$repo_front"); D_FRONT=${D_FRONT#sha256:}
-
-          test -n "$D_PROD"  || { echo "No digest for $repo_prod:$TAG";  exit 1; }
-          test -n "$D_ORDR"  || { echo "No digest for $repo_ordr:$TAG";  exit 1; }
-          test -n "$D_CUST"  || { echo "No digest for $repo_cust:$TAG";  exit 1; }
-          test -n "$D_FRONT" || { echo "No digest for $repo_front:$TAG"; exit 1; }
+          test -n "$D_PROD"  && test -n "$D_ORDR" && test -n "$D_CUST" && test -n "$D_FRONT"
 
           echo "d_prod=$D_PROD"   >> "$GITHUB_OUTPUT"
           echo "d_ordr=$D_ORDR"   >> "$GITHUB_OUTPUT"
@@ -375,6 +385,7 @@ jobs:
     uses: ./.github/workflows/backend-cd.yml
     with:
       k8s_namespace: ecommerce
+      acr_login_server: ${{ needs.infra_prod.outputs.prod_acr }}
     secrets: inherit
 
   pin_backend_prod:
@@ -385,16 +396,13 @@ jobs:
       - uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-
       - name: Set AKS context
         run: az aks get-credentials -n "${{ needs.infra_prod.outputs.prod_aks_name }}" -g "${{ needs.infra_prod.outputs.prod_aks_rg }}" --overwrite-existing
-
-      - name: Install jq (for JSON patch helper)
+      - name: Install jq
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y jq
           fi
-
       - name: Pin backend images by digest
         env:
           NS: ecommerce
@@ -428,8 +436,10 @@ jobs:
     uses: ./.github/workflows/frontend-cd.yml
     with:
       k8s_namespace: ecommerce
+      acr_login_server: ${{ needs.infra_prod.outputs.prod_acr }}
       product_api_ip:  "http://${{ needs.backend_cd_prod.outputs.product_api_ip }}:8000"
       order_api_ip:    "http://${{ needs.backend_cd_prod.outputs.order_api_ip }}:8001"
       customer_api_ip: "http://${{ needs.backend_cd_prod.outputs.customer_api_ip }}:8002"
       frontend_tag:    ${{ needs.promote_images_prod.outputs.tag }}
+      build_in_cd: false
     secrets: inherit

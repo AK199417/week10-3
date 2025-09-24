@@ -1,12 +1,16 @@
 name: Backend CI - Test, Build and Push Images to ACR
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      acr_login_server:
+        required: false
+        type: string
   pull_request:
     branches: [ main, dev, develop ]
 
 env:
-  ACR_LOGIN_SERVER: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+  ACR_LOGIN_SERVER: ${{ inputs.acr_login_server }}
 
 jobs:
   test_and_lint_backends:
@@ -24,8 +28,7 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-        ports:
-          - "5432:5432"
+        ports: ["5432:5432"]
 
       order_db:
         image: postgres:15
@@ -38,8 +41,7 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-        ports:
-          - "5433:5432"
+        ports: ["5433:5432"]
 
       customer_db:
         image: postgres:15
@@ -52,8 +54,7 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-        ports:
-          - "5434:5432"
+        ports: ["5434:5432"]
 
     steps:
       - uses: actions/checkout@v4
@@ -115,92 +116,33 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Derive ACR name and SHORT_SHA
+      - name: Validate ACR server provided by orchestrator
         run: |
+          : "${ACR_LOGIN_SERVER:?ACR login server missing}"   # fail if empty
+          echo "Using ACR: $ACR_LOGIN_SERVER"
           echo "ACR_NAME=${ACR_LOGIN_SERVER%%.*}" >> $GITHUB_ENV
           echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
 
-      - name: Login to Azure Container Registry
+      - name: Login to Azure Container Registry (AAD)
         run: az acr login --name "${{ env.ACR_NAME }}"
 
-      # ----- build or skip if tag already exists -----
-      - name: Build & Push product_service (idempotent)
+      - name: Build & Push product_service
         run: |
-          set -euo pipefail
-          TAG="$SHORT_SHA"
-          REPO="product_service"
-          EXIST_DIGEST=$(az acr repository show-manifests -n "$ACR_NAME" --repository "$REPO" \
-            --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
-          if [ -n "$EXIST_DIGEST" ]; then
-            echo "SKIP: $REPO:$TAG already exists ($EXIST_DIGEST)"
-          else
-            docker build -t $ACR_LOGIN_SERVER/$REPO:latest -t $ACR_LOGIN_SERVER/$REPO:$TAG ./backend/product_service/
-            docker push  $ACR_LOGIN_SERVER/$REPO:latest
-            docker push  $ACR_LOGIN_SERVER/$REPO:$TAG
-          fi
+          docker build -t ${{ env.ACR_LOGIN_SERVER }}/product_service:latest -t ${{ env.ACR_LOGIN_SERVER }}/product_service:${SHORT_SHA} ./backend/product_service/
+          docker push  ${{ env.ACR_LOGIN_SERVER }}/product_service:latest
+          docker push  ${{ env.ACR_LOGIN_SERVER }}/product_service:${SHORT_SHA}
 
-      - name: Build & Push order_service (idempotent)
+      - name: Build & Push order_service
         run: |
-          set -euo pipefail
-          TAG="$SHORT_SHA"
-          REPO="order_service"
-          EXIST_DIGEST=$(az acr repository show-manifests -n "$ACR_NAME" --repository "$REPO" \
-            --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
-          if [ -n "$EXIST_DIGEST" ]; then
-            echo "SKIP: $REPO:$TAG already exists ($EXIST_DIGEST)"
-          else
-            docker build -t $ACR_LOGIN_SERVER/$REPO:latest -t $ACR_LOGIN_SERVER/$REPO:$TAG ./backend/order_service/
-            docker push  $ACR_LOGIN_SERVER/$REPO:latest
-            docker push  $ACR_LOGIN_SERVER/$REPO:$TAG
-          fi
+          docker build -t ${{ env.ACR_LOGIN_SERVER }}/order_service:latest -t ${{ env.ACR_LOGIN_SERVER }}/order_service:${SHORT_SHA} ./backend/order_service/
+          docker push  ${{ env.ACR_LOGIN_SERVER }}/order_service:latest
+          docker push  ${{ env.ACR_LOGIN_SERVER }}/order_service:${SHORT_SHA}
 
-      - name: Build & Push customer_service (idempotent)
+      - name: Build & Push customer_service
         run: |
-          set -euo pipefail
-          TAG="$SHORT_SHA"
-          REPO="customer_service"
-          EXIST_DIGEST=$(az acr repository show-manifests -n "$ACR_NAME" --repository "$REPO" \
-            --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
-          if [ -n "$EXIST_DIGEST" ]; then
-            echo "SKIP: $REPO:$TAG already exists ($EXIST_DIGEST)"
-          else
-            docker build -t $ACR_LOGIN_SERVER/$REPO:latest -t $ACR_LOGIN_SERVER/$REPO:$TAG ./backend/customer_service/
-            docker push  $ACR_LOGIN_SERVER/$REPO:latest
-            docker push  $ACR_LOGIN_SERVER/$REPO:$TAG
-          fi
-
-      - name: Ensure jq
-        run: |
-          if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y jq
-          fi
-
-      # ----- capture immutable digests for this tag -----
-      - name: Capture digests and upload release metadata
-        run: |
-          set -euo pipefail
-          TAG="$SHORT_SHA"
-          D_PROD=$(az acr repository show-manifests -n "$ACR_NAME" --repository product_service   --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
-          D_ORDR=$(az acr repository show-manifests -n "$ACR_NAME" --repository order_service     --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
-          D_CUST=$(az acr repository show-manifests -n "$ACR_NAME" --repository customer_service  --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv)
-
-          mkdir -p _deploy
-          jq -n --arg tag "$TAG" \
-                --arg d_prod "$D_PROD" \
-                --arg d_ordr "$D_ORDR" \
-                --arg d_cust "$D_CUST" \
-                '{tag:$tag, product_service:$d_prod, order_service:$d_ordr, customer_service:$d_cust}' \
-            > _deploy/backend-release.json
-
-          echo "Generated _deploy/backend-release.json:"
-          cat _deploy/backend-release.json
-
-      - name: Upload backend release artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-release
-          path: _deploy/backend-release.json
+          docker build -t ${{ env.ACR_LOGIN_SERVER }}/customer_service:latest -t ${{ env.ACR_LOGIN_SERVER }}/customer_service:${SHORT_SHA} ./backend/customer_service/
+          docker push  ${{ env.ACR_LOGIN_SERVER }}/customer_service:latest
+          docker push  ${{ env.ACR_LOGIN_SERVER }}/customer_service:${SHORT_SHA}
 
       - name: Logout Azure
         if: always()
