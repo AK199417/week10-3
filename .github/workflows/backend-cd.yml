@@ -31,14 +31,10 @@ permissions:
   contents: read
 
 env:
-  # Default namespace (caller still passes their intended one)
   K8S_NAMESPACE: ecommerce
-
-  # Deployment/Service names
   PRODUCT_DEPLOY:    product-service-w05-aks
   ORDER_DEPLOY:      order-service-w05-aks
   CUSTOMER_DEPLOY:   customer-service-w05-aks
-
   PRODUCT_SVC_NAME:  product-service-w05-aks
   ORDER_SVC_NAME:    order-service-w05-aks
   CUSTOMER_SVC_NAME: customer-service-w05-aks
@@ -72,7 +68,6 @@ jobs:
           SECRET_ACR_LOGIN:      ${{ secrets.AZURE_CONTAINER_REGISTRY }}
         run: |
           set -Eeuo pipefail
-
           NS_INPUT="${INPUT_NS:-${K8S_NAMESPACE}}"
           echo "K8S_NAMESPACE_RESOLVED=$NS_INPUT" >> $GITHUB_ENV
 
@@ -92,7 +87,6 @@ jobs:
           ACR_NAME="${ACR_LOGIN%%.*}"
           echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
 
-      # --- Fix 1: attach ACR to AKS (idempotent) ---
       - name: Attach ACR to AKS (idempotent)
         shell: bash
         run: |
@@ -110,103 +104,105 @@ jobs:
         run: |
           kubectl get ns "$K8S_NAMESPACE_RESOLVED" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE_RESOLVED"
 
-      # --- Fix 2: fallback image pull secret (works immediately if role propagation is slow) ---
-      - name: Create/patch ACR imagePullSecret (fallback)
+      # 🔧 NEW: Avoid Docker Hub by rewriting 3rd-party images to ECR Public mirrors
+      - name: Patch DB/RabbitMQ images to ECR Public mirrors
         shell: bash
         run: |
           set -Eeuo pipefail
-          NS="$K8S_NAMESPACE_RESOLVED"
-          # Ensure ACR admin is enabled to fetch a username/password
-          az acr update -n "$ACR_NAME" --admin-enabled true >/dev/null
-          ACR_USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
-          ACR_PASS=$(az acr credential show -n "$ACR_NAME" --query 'passwords[0].value' -o tsv)
-          kubectl -n "$NS" delete secret acr-pull --ignore-not-found
-          kubectl -n "$NS" create secret docker-registry acr-pull \
-            --docker-server="$ACR_LOGIN_SERVER" \
-            --docker-username="$ACR_USER" \
-            --docker-password="$ACR_PASS"
-          # Patch default SA so all pods use it
-          kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-pull"}]}' || true
+          for f in k8s/*.yaml; do
+            # postgres -> public ECR mirror
+            sed -i -E 's|image:[[:space:]]*postgres:([[:alnum:]._-]+)|image: public.ecr.aws/docker/library/postgres:\1|g' "$f"
+            # rabbitmq -> public ECR mirror
+            sed -i -E 's|image:[[:space:]]*rabbitmq:([[:alnum:]._-]+)|image: public.ecr.aws/docker/library/rabbitmq:\1|g' "$f"
+          done
+          echo "After patch:"
+          grep -nE 'image:.*(postgres|rabbitmq)' k8s/*.yaml || true
 
       # Optional cleanup for fresh rollout
       - name: Delete old deployments (ignore if missing)
         shell: bash
+        env:
+          NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
         run: |
           set -Eeuo pipefail
-          NS="$K8S_NAMESPACE_RESOLVED"
-          kubectl -n "${NS}" delete deploy "${{ env.PRODUCT_DEPLOY }}"  --ignore-not-found
-          kubectl -n "${NS}" delete deploy "${{ env.ORDER_DEPLOY }}"    --ignore-not-found
-          kubectl -n "${NS}" delete deploy "${{ env.CUSTOMER_DEPLOY }}" --ignore-not-found
+          kubectl -n ${NS} delete deploy "${{ env.PRODUCT_DEPLOY }}"  --ignore-not-found
+          kubectl -n ${NS} delete deploy "${{ env.ORDER_DEPLOY }}"    --ignore-not-found
+          kubectl -n ${NS} delete deploy "${{ env.CUSTOMER_DEPLOY }}" --ignore-not-found
 
       - name: Apply base manifests (Config/Secrets + RabbitMQ)
         shell: bash
+        env:
+          NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
         run: |
           set -Eeuo pipefail
-          NS="$K8S_NAMESPACE_RESOLVED"
-          kubectl apply -n "${NS}" -f k8s/configmaps.yaml
-          kubectl apply -n "${NS}" -f k8s/secrets.yaml
-          kubectl apply -n "${NS}" -f k8s/rabbitmq.yaml || true
+          kubectl apply -n ${NS} -f k8s/configmaps.yaml
+          kubectl apply -n ${NS} -f k8s/secrets.yaml
+          kubectl apply -n ${NS} -f k8s/rabbitmq.yaml || true
 
       - name: Wait for RabbitMQ (best-effort)
         shell: bash
+        env:
+          NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
         run: |
           set -Eeuo pipefail
-          NS="$K8S_NAMESPACE_RESOLVED"
-          if kubectl -n "${NS}" get statefulset rabbitmq >/dev/null 2>&1; then
-            kubectl -n "${NS}" rollout status statefulset/rabbitmq --timeout=180s
-          elif kubectl -n "${NS}" get deploy rabbitmq >/dev/null 2>&1; then
-            kubectl -n "${NS}" rollout status deploy/rabbitmq --timeout=180s
-          elif kubectl -n "${NS}" get deploy rabbitmq-deployment >/dev/null 2>&1; then
-            kubectl -n "${NS}" rollout status deploy/rabbitmq-deployment --timeout=180s
+          if kubectl -n ${NS} get statefulset rabbitmq >/dev/null 2>&1; then
+            kubectl -n ${NS} rollout status statefulset/rabbitmq --timeout=180s
+          elif kubectl -n ${NS} get deploy rabbitmq >/dev/null 2>&1; then
+            kubectl -n ${NS} rollout status deploy/rabbitmq --timeout=180s
+          elif kubectl -n ${NS} get deploy rabbitmq-deployment >/dev/null 2>&1; then
+            kubectl -n ${NS} rollout status deploy/rabbitmq-deployment --timeout=180s
           else
             echo "WARN: RabbitMQ workload not found; continuing"
           fi
 
       - name: Apply DBs and Backend services
         shell: bash
+        env:
+          NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
         run: |
           set -Eeuo pipefail
-          NS="$K8S_NAMESPACE_RESOLVED"
-          kubectl apply -n "${NS}" -f k8s/product-db.yaml
-          kubectl apply -n "${NS}" -f k8s/order-db.yaml
-          kubectl apply -n "${NS}" -f k8s/customer-db.yaml
-          kubectl apply -n "${NS}" -f k8s/product-service.yaml
-          kubectl apply -n "${NS}" -f k8s/order-service.yaml
-          kubectl apply -n "${NS}" -f k8s/customer-service.yaml
+          kubectl apply -n ${NS} -f k8s/product-db.yaml
+          kubectl apply -n ${NS} -f k8s/order-db.yaml
+          kubectl apply -n ${NS} -f k8s/customer-db.yaml
+          kubectl apply -n ${NS} -f k8s/product-service.yaml
+          kubectl apply -n ${NS} -f k8s/order-service.yaml
+          kubectl apply -n ${NS} -f k8s/customer-service.yaml
 
       - name: Set images to ACR (:latest) and rollout
         shell: bash
+        env:
+          NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
+          ACR: ${{ env.ACR_LOGIN_SERVER }}
         run: |
           set -Eeuo pipefail
-          NS="$K8S_NAMESPACE_RESOLVED"
-          ACR="$ACR_LOGIN_SERVER"
-          kubectl -n "${NS}" set image deploy/${{ env.PRODUCT_DEPLOY }}   product-service-container="${ACR}/product_service:latest"
-          kubectl -n "${NS}" set image deploy/${{ env.ORDER_DEPLOY }}     order-service-container="${ACR}/order_service:latest"
-          kubectl -n "${NS}" set image deploy/${{ env.CUSTOMER_DEPLOY }}  customer-service-container="${ACR}/customer_service:latest"
-          kubectl -n "${NS}" rollout restart deploy/${{ env.PRODUCT_DEPLOY }}
-          kubectl -n "${NS}" rollout restart deploy/${{ env.ORDER_DEPLOY }}
-          kubectl -n "${NS}" rollout restart deploy/${{ env.CUSTOMER_DEPLOY }}
-          kubectl -n "${NS}" rollout status deploy/${{ env.PRODUCT_DEPLOY }}  --timeout=300s
-          kubectl -n "${NS}" rollout status deploy/${{ env.ORDER_DEPLOY }}    --timeout=300s
-          kubectl -n "${NS}" rollout status deploy/${{ env.CUSTOMER_DEPLOY }} --timeout=300s
+          kubectl -n ${NS} set image deploy/${{ env.PRODUCT_DEPLOY }}   product-service-container=${ACR}/product_service:latest
+          kubectl -n ${NS} set image deploy/${{ env.ORDER_DEPLOY }}     order-service-container=${ACR}/order_service:latest
+          kubectl -n ${NS} set image deploy/${{ env.CUSTOMER_DEPLOY }}  customer-service-container=${ACR}/customer_service:latest
+          kubectl -n ${NS} rollout restart deploy/${{ env.PRODUCT_DEPLOY }}
+          kubectl -n ${NS} rollout restart deploy/${{ env.ORDER_DEPLOY }}
+          kubectl -n ${NS} rollout restart deploy/${{ env.CUSTOMER_DEPLOY }}
+          kubectl -n ${NS} rollout status deploy/${{ env.PRODUCT_DEPLOY }}  --timeout=300s
+          kubectl -n ${NS} rollout status deploy/${{ env.ORDER_DEPLOY }}    --timeout=300s
+          kubectl -n ${NS} rollout status deploy/${{ env.CUSTOMER_DEPLOY }} --timeout=300s
 
       - name: Wait for Backend LoadBalancer IPs
         shell: bash
+        env:
+          NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
         run: |
           set -Eeuo pipefail
-          NS="$K8S_NAMESPACE_RESOLVED"
           echo "Waiting for EXTERNAL-IPs in namespace ${NS}..."
           for i in $(seq 1 60); do
-            PRODUCT_IP=$(kubectl get svc -n "${NS}" "$PRODUCT_SVC_NAME"  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-            ORDER_IP=$(kubectl   get svc -n "${NS}" "$ORDER_SVC_NAME"    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-            CUSTOMER_IP=$(kubectl get svc -n "${NS}" "$CUSTOMER_SVC_NAME" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            PRODUCT_IP=$(kubectl get svc -n ${NS} "$PRODUCT_SVC_NAME"  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            ORDER_IP=$(kubectl   get svc -n ${NS} "$ORDER_SVC_NAME"    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+            CUSTOMER_IP=$(kubectl get svc -n ${NS} "$CUSTOMER_SVC_NAME" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
             [[ -n "$PRODUCT_IP" && -n "$ORDER_IP" && -n "$CUSTOMER_IP" ]] && break
             sleep 5
           done
           if [[ -z "$PRODUCT_IP" || -z "$ORDER_IP" || -z "$CUSTOMER_IP" ]]; then
             echo "ERROR: Service EXTERNAL-IPs not assigned"
-            kubectl get svc -n "${NS}"
-            kubectl get pods -n "${NS}"
+            kubectl get pods -n ${NS}
+            kubectl get svc  -n ${NS}
             exit 1
           fi
           echo "PRODUCT_IP=$PRODUCT_IP"   >> $GITHUB_ENV
@@ -214,11 +210,11 @@ jobs:
           echo "CUSTOMER_IP=$CUSTOMER_IP" >> $GITHUB_ENV
 
       - id: get_product_ip
-        run: echo "external_ip=${PRODUCT_IP}" >> $GITHUB_OUTPUT
+        run: echo "external_ip=${{ env.PRODUCT_IP }}" >> $GITHUB_OUTPUT
       - id: get_order_ip
-        run: echo "external_ip=${ORDER_IP}" >> $GITHUB_OUTPUT
+        run: echo "external_ip=${{ env.ORDER_IP }}" >> $GITHUB_OUTPUT
       - id: get_customer_ip
-        run: echo "external_ip=${CUSTOMER_IP}" >> $GITHUB_OUTPUT
+        run: echo "external_ip=${{ env.CUSTOMER_IP }}" >> $GITHUB_OUTPUT
 
       - name: Summary
         shell: bash
