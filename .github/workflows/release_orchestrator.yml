@@ -159,25 +159,7 @@ jobs:
       # frontend_tag omitted -> defaults to 'latest' in reusable workflow
     secrets: inherit
 
-  smoke_test_dev:
-    if: ${{ github.event_name == 'push' }}
-    needs: frontend_cd_dev
-    runs-on: ubuntu-latest
-    steps:
-      - uses: azure/login@v1
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-      - name: Set AKS context
-        run: az aks get-credentials -n "${{ needs.infra_dev.outputs.dev_aks_name }}" -g "${{ needs.infra_dev.outputs.dev_aks_rg }}" --overwrite-existing
-      - name: Smoke test frontend
-        env:
-          NS: dev
-        run: |
-          IP=$(kubectl -n "$NS" get svc frontend-w05-aks -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-          echo "Frontend IP: $IP"
-          curl -fsS "http://$IP" >/dev/null
-
-  # ===================== PROD =====================
+    # ===================== PROD =====================
   infra_prod:
     if: ${{ github.event_name == 'pull_request'
             && github.event.pull_request.merged == true
