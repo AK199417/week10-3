@@ -15,12 +15,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # PRs: build only (no push)
+      # Patch frontend Dockerfile to avoid Docker Hub rate limits
+      # - nginx -> public.ecr.aws/docker/library/nginx
+      # - node  -> public.ecr.aws/docker/library/node  (in case you use multi-stage builds)
+      - name: Patch Dockerfile base images to ECR Public mirrors
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          DF="frontend/Dockerfile"
+          if [ -f "$DF" ]; then
+            # nginx
+            sed -i -E 's|^FROM[[:space:]]+nginx:([[:alnum:]._-]+)|FROM public.ecr.aws/docker/library/nginx:\1|' "$DF" || true
+            # node (optional if present)
+            sed -i -E 's|^FROM[[:space:]]+node:([[:alnum:]._-]+)|FROM public.ecr.aws/docker/library/node:\1|' "$DF" || true
+            echo "Dockerfile FROM lines after patch:"
+            grep -n '^FROM ' "$DF" || true
+          else
+            echo "No frontend/Dockerfile found"; exit 1
+          fi
+
+      # PRs: build only
       - name: Build Frontend (PR check only)
         if: ${{ github.event_name == 'pull_request' }}
         run: docker build -t frontend-ci-check ./frontend/
 
-      # Non-PRs (called by orchestrator): login and push
+      # Non-PRs: login and push to ACR
       - name: Azure Login
         if: ${{ github.event_name != 'pull_request' }}
         uses: azure/login@v1
@@ -32,23 +51,17 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Required input from orchestrator
           ACR_LOGIN_SERVER="${{ inputs.acr_login_server }}"
           [ -n "$ACR_LOGIN_SERVER" ] || { echo "Missing input: acr_login_server"; exit 1; }
           echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER" >> $GITHUB_ENV
-
-          # Derive ACR_NAME in bash (can't use %% in GitHub expressions)
           ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
           echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
-
-          # SHORT_SHA for immutable tag
           echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
 
       - name: Login to Azure Container Registry
         if: ${{ github.event_name != 'pull_request' }}
         shell: bash
-        run: |
-          az acr login --name "$ACR_NAME"
+        run: az acr login --name "$ACR_NAME"
 
       - name: Build & Push frontend (:latest and :SHORT_SHA)
         if: ${{ github.event_name != 'pull_request' }}
