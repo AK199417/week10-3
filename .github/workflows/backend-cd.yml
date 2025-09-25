@@ -104,19 +104,44 @@ jobs:
         run: |
           kubectl get ns "$K8S_NAMESPACE_RESOLVED" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE_RESOLVED"
 
-      # 🔧 NEW: Avoid Docker Hub by rewriting 3rd-party images to ECR Public mirrors
+      # NEW: namespace-scoped imagePullSecret (fallback while RBAC propagates)
+      - name: Create/patch imagePullSecret (acr-pull)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          NS="$K8S_NAMESPACE_RESOLVED"
+          az acr update -n "$ACR_NAME" --admin-enabled true >/dev/null
+          ACR_USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
+          ACR_PASS=$(az acr credential show -n "$ACR_NAME" --query 'passwords[0].value' -o tsv)
+          kubectl -n "$NS" delete secret acr-pull --ignore-not-found
+          kubectl -n "$NS" create secret docker-registry acr-pull \
+            --docker-server="$ACR_LOGIN_SERVER" \
+            --docker-username="$ACR_USER" \
+            --docker-password="$ACR_PASS"
+          kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-pull"}]}' || true
+
+      # Avoid Docker Hub throttling for runtime infra images
       - name: Patch DB/RabbitMQ images to ECR Public mirrors
         shell: bash
         run: |
           set -Eeuo pipefail
           for f in k8s/*.yaml; do
-            # postgres -> public ECR mirror
             sed -i -E 's|image:[[:space:]]*postgres:([[:alnum:]._-]+)|image: public.ecr.aws/docker/library/postgres:\1|g' "$f"
-            # rabbitmq -> public ECR mirror
             sed -i -E 's|image:[[:space:]]*rabbitmq:([[:alnum:]._-]+)|image: public.ecr.aws/docker/library/rabbitmq:\1|g' "$f"
           done
           echo "After patch:"
           grep -nE 'image:.*(postgres|rabbitmq)' k8s/*.yaml || true
+
+      # NEW: normalize any hard-coded azurecr.io registry in app YAMLs to the target ACR
+      - name: Normalize app image registries to target ACR
+        shell: bash
+        env:
+          ACR: ${{ env.ACR_LOGIN_SERVER }}
+        run: |
+          set -Eeuo pipefail
+          sed -i -E "s|image:\s*[A-Za-z0-9.-]+\.azurecr\.io/product_service:[^[:space:]]+|image: ${ACR}/product_service:latest|g" k8s/*.yaml || true
+          sed -i -E "s|image:\s*[A-Za-z0-9.-]+\.azurecr\.io/order_service:[^[:space:]]+|image: ${ACR}/order_service:latest|g"   k8s/*.yaml || true
+          sed -i -E "s|image:\s*[A-Za-z0-9.-]+\.azurecr\.io/customer_service:[^[:space:]]+|image: ${ACR}/customer_service:latest|g" k8s/*.yaml || true
 
       # Optional cleanup for fresh rollout
       - name: Delete old deployments (ignore if missing)
