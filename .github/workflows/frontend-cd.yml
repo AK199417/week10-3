@@ -3,27 +3,46 @@ name: CD - Deploy Frontend to AKS
 on:
   workflow_call:
     inputs:
-      product_api_ip:   { required: false, type: string }
-      order_api_ip:     { required: false, type: string }
-      customer_api_ip:  { required: false, type: string }
-      k8s_namespace:    { required: false, type: string }
-      aks_cluster_name: { required: false, type: string }
-      aks_resource_group: { required: false, type: string }
-      acr_login_server: { required: false, type: string }
-      frontend_tag:     { required: false, type: string }
-  workflow_dispatch: {}  # You can still run it manually; it will use secrets if inputs omitted.
+      k8s_namespace:
+        required: true
+        type: string
+      product_api_ip:
+        required: false
+        type: string
+      order_api_ip:
+        required: false
+        type: string
+      customer_api_ip:
+        required: false
+        type: string
+      aks_cluster_name:
+        required: false
+        type: string
+      aks_resource_group:
+        required: false
+        type: string
+      acr_login_server:
+        required: false
+        type: string
+      frontend_tag:
+        required: false
+        type: string
+  workflow_dispatch: {}
 
 permissions:
   contents: read
 
 env:
-  FRONTEND_DEPLOY:    frontend-w05-aks
+  # Defaults that the caller can override
+  K8S_NAMESPACE_DEFAULT: dev
+  FRONTEND_DEPLOY:   frontend-w05-aks
   FRONTEND_CONTAINER: frontend-container
 
 jobs:
   deploy_frontend:
     runs-on: ubuntu-latest
     environment: Production
+
     steps:
       - uses: actions/checkout@v4
 
@@ -32,62 +51,94 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Resolve inputs (fallback to secrets)
+      - name: Resolve inputs (namespace, AKS, ACR, tag, API URLs)
+        id: resolve
         shell: bash
         env:
-          IN_NS:          ${{ inputs.k8s_namespace }}
-          IN_AKS_RG:      ${{ inputs.aks_resource_group }}
-          IN_AKS_NAME:    ${{ inputs.aks_cluster_name }}
-          IN_ACR:         ${{ inputs.acr_login_server }}
-          IN_TAG:         ${{ inputs.frontend_tag }}
-          SEC_AKS_RG:     ${{ secrets.AKS_RESOURCE_GROUP }}
-          SEC_AKS_NAME:   ${{ secrets.AKS_CLUSTER_NAME }}
-          SEC_ACR:        ${{ secrets.AZURE_CONTAINER_REGISTRY }}
-          IN_PROD_URL:    ${{ inputs.product_api_ip }}
-          IN_ORDER_URL:   ${{ inputs.order_api_ip }}
-          IN_CUST_URL:    ${{ inputs.customer_api_ip }}
+          IN_NS:        ${{ inputs.k8s_namespace }}
+          IN_AKS_RG:    ${{ inputs.aks_resource_group }}
+          IN_AKS_NAME:  ${{ inputs.aks_cluster_name }}
+          IN_ACR:       ${{ inputs.acr_login_server }}
+          IN_TAG:       ${{ inputs.frontend_tag }}
+          IN_PROD_URL:  ${{ inputs.product_api_ip }}
+          IN_ORDER_URL: ${{ inputs.order_api_ip }}
+          IN_CUST_URL:  ${{ inputs.customer_api_ip }}
+          SEC_AKS_RG:   ${{ secrets.AKS_RESOURCE_GROUP }}
+          SEC_AKS_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
+          SEC_ACR:      ${{ secrets.AZURE_CONTAINER_REGISTRY }}
         run: |
           set -Eeuo pipefail
-          NS="${IN_NS:-dev}"
+
+          # Namespace (required by workflow_call, but keep a default for safety)
+          NS="${IN_NS:-$K8S_NAMESPACE_DEFAULT}"
           echo "K8S_NAMESPACE_RESOLVED=$NS" >> $GITHUB_ENV
 
+          # AKS RG/Name: prefer inputs, then secrets, then auto-detect
           AKS_RG="${IN_AKS_RG:-$SEC_AKS_RG}"
           AKS_NAME="${IN_AKS_NAME:-$SEC_AKS_NAME}"
+
           if [[ -z "$AKS_RG" || -z "$AKS_NAME" ]]; then
-            echo "ERROR: aks_resource_group/aks_cluster_name not provided and secrets missing"; exit 1
+            echo "AKS RG/Name not provided; attempting auto-detect…" >&2
+            # Try to pick the first cluster in the subscription, or the first in a known RG
+            if [[ -n "$SEC_AKS_RG" ]]; then
+              AKS_NAME=$(az aks list -g "$SEC_AKS_RG" --query '[0].name' -o tsv 2>/dev/null || true)
+              AKS_RG="$SEC_AKS_RG"
+            fi
+            if [[ -z "$AKS_NAME" ]]; then
+              AKS_NAME=$(az aks list --query '[0].name' -o tsv 2>/dev/null || true)
+              if [[ -n "$AKS_NAME" ]]; then
+                AKS_RG=$(az aks show -n "$AKS_NAME" --query resourceGroup -o tsv)
+              fi
+            fi
+          fi
+
+          if [[ -z "$AKS_RG" || -z "$AKS_NAME" ]]; then
+            echo "ERROR: aks_resource_group/aks_cluster_name not provided and could not auto-detect." >&2
+            exit 1
           fi
           echo "AKS_RESOURCE_GROUP=$AKS_RG" >> $GITHUB_ENV
           echo "AKS_CLUSTER_NAME=$AKS_NAME" >> $GITHUB_ENV
 
+          # ACR login server
           ACR_LOGIN_SERVER="${IN_ACR:-$SEC_ACR}"
           if [[ -z "$ACR_LOGIN_SERVER" ]]; then
-            echo "ERROR: acr_login_server not provided and AZURE_CONTAINER_REGISTRY secret missing"; exit 1
+            echo "ERROR: acr_login_server not provided and AZURE_CONTAINER_REGISTRY secret missing" >&2
+            exit 1
           fi
           echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER" >> $GITHUB_ENV
           ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
           echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
 
+          # Tag (default to latest)
           TAG="${IN_TAG:-latest}"
           echo "FRONTEND_TAG=$TAG" >> $GITHUB_ENV
 
-          # optional backend URLs (if orchestrator passed them)
-          [ -n "$IN_PROD_URL" ]  && echo "PRODUCT_URL=$IN_PROD_URL"   >> $GITHUB_ENV
-          [ -n "$IN_ORDER_URL" ] && echo "ORDER_URL=$IN_ORDER_URL"     >> $GITHUB_ENV
-          [ -n "$IN_CUST_URL" ]  && echo "CUSTOMER_URL=$IN_CUST_URL"   >> $GITHUB_ENV
+          # Backend URLs (optional)
+          [[ -n "${IN_PROD_URL}"  ]] && echo "PRODUCT_URL=$IN_PROD_URL"   >> $GITHUB_ENV
+          [[ -n "${IN_ORDER_URL}" ]] && echo "ORDER_URL=$IN_ORDER_URL"    >> $GITHUB_ENV
+          [[ -n "${IN_CUST_URL}"  ]] && echo "CUSTOMER_URL=$IN_CUST_URL"  >> $GITHUB_ENV
 
-      # Ensure AKS can pull from ACR (and fallback secret)
-      - name: Attach ACR to AKS (idempotent)
-        run: az aks update -g "$AKS_RESOURCE_GROUP" -n "$AKS_CLUSTER_NAME" --attach-acr "$ACR_NAME" || true
+          echo "Resolved:"
+          echo "  Namespace  = $NS"
+          echo "  AKS        = $AKS_RG / $AKS_NAME"
+          echo "  ACR        = $ACR_LOGIN_SERVER (name: $ACR_NAME)"
+          echo "  Tag        = $TAG"
+          echo "  ProductURL = ${IN_PROD_URL:-<unchanged>}"
+          echo "  OrderURL   = ${IN_ORDER_URL:-<unchanged>}"
+          echo "  CustomerURL= ${IN_CUST_URL:-<unchanged>}"
 
       - name: Set AKS context
+        shell: bash
         run: |
           az aks get-credentials -g "$AKS_RESOURCE_GROUP" -n "$AKS_CLUSTER_NAME" --overwrite-existing
           kubectl cluster-info
 
       - name: Ensure namespace exists
-        run: kubectl get ns "$K8S_NAMESPACE_RESOLVED" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE_RESOLVED"
+        shell: bash
+        run: |
+          kubectl get ns "$K8S_NAMESPACE_RESOLVED" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE_RESOLVED"
 
-      - name: Create/patch ACR imagePullSecret (fallback)
+      - name: Create/patch imagePullSecret (acr-pull)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -102,23 +153,42 @@ jobs:
             --docker-password="$ACR_PASS"
           kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-pull"}]}' || true
 
-      # Inject backend URLs if provided
-      - name: Inject backend URLs into main.js (if provided)
-        if: ${{ env.PRODUCT_URL != '' && env.ORDER_URL != '' && env.CUSTOMER_URL != '' }}
+      - name: Inject backend URLs into frontend/main.js (only if provided)
+        if: ${{ inputs.product_api_ip || inputs.order_api_ip || inputs.customer_api_ip }}
+        shell: bash
         run: |
-          sed -i "s|_PRODUCT_API_URL_|${PRODUCT_URL}|g"   frontend/main.js
-          sed -i "s|_ORDER_API_URL_|${ORDER_URL}|g"       frontend/main.js
-          sed -i "s|_CUSTOMER_API_URL_|${CUSTOMER_URL}|g" frontend/main.js
+          set -Eeuo pipefail
+          [[ -n "${PRODUCT_URL:-}"  ]] && sed -i "s|_PRODUCT_API_URL_|${PRODUCT_URL}|g"     frontend/main.js
+          [[ -n "${ORDER_URL:-}"    ]] && sed -i "s|_ORDER_API_URL_|${ORDER_URL}|g"         frontend/main.js
+          [[ -n "${CUSTOMER_URL:-}" ]] && sed -i "s|_CUSTOMER_API_URL_|${CUSTOMER_URL}|g"   frontend/main.js
+          echo "Patched main.js with provided backend URLs."
 
-      - name: Apply manifests
-        run: kubectl apply -n "$K8S_NAMESPACE_RESOLVED" -f k8s/frontend.yaml
+      # Normalize any hard-coded registry in the manifest
+      - name: Normalize frontend image registry to target ACR
+        shell: bash
+        env:
+          ACR: ${{ env.ACR_LOGIN_SERVER }}
+        run: |
+          set -Eeuo pipefail
+          sed -i -E "s|image:\s*[A-Za-z0-9.-]+\.azurecr\.io/frontend:[^[:space:]]+|image: ${ACR}/frontend:${FRONTEND_TAG}|g" k8s/frontend.yaml || true
+
+      - name: Apply manifest
+        shell: bash
+        run: |
+          kubectl apply -n "$K8S_NAMESPACE_RESOLVED" -f k8s/frontend.yaml
 
       - name: Set image and rollout
+        shell: bash
+        env:
+          NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
+          ACR: ${{ env.ACR_LOGIN_SERVER }}
+          TAG: ${{ env.FRONTEND_TAG }}
         run: |
-          kubectl -n "$K8S_NAMESPACE_RESOLVED" set image deploy/${{ env.FRONTEND_DEPLOY }} \
-            ${{ env.FRONTEND_CONTAINER }}="${ACR_LOGIN_SERVER}/frontend:${FRONTEND_TAG}"
-          kubectl -n "$K8S_NAMESPACE_RESOLVED" rollout restart deploy/${{ env.FRONTEND_DEPLOY }}
-          kubectl -n "$K8S_NAMESPACE_RESOLVED" rollout status  deploy/${{ env.FRONTEND_DEPLOY }} --timeout=300s
+          set -Eeuo pipefail
+          kubectl -n "${NS}" set image deploy/${{ env.FRONTEND_DEPLOY }} \
+            ${{ env.FRONTEND_CONTAINER }}=${ACR}/frontend:${TAG}
+          kubectl -n "${NS}" rollout restart deploy/${{ env.FRONTEND_DEPLOY }}
+          kubectl -n "${NS}" rollout status  deploy/${{ env.FRONTEND_DEPLOY }} --timeout=300s
 
       - name: Logout Azure
         if: always()
