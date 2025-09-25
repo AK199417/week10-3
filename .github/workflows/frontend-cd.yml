@@ -33,7 +33,6 @@ permissions:
   contents: read
 
 env:
-  # Defaults that the caller can override
   K8S_NAMESPACE_DEFAULT: dev
   FRONTEND_DEPLOY:   frontend-w05-aks
   FRONTEND_CONTAINER: frontend-container
@@ -69,17 +68,15 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          # Namespace (required by workflow_call, but keep a default for safety)
+          # Namespace (required by caller; keep default as safety)
           NS="${IN_NS:-$K8S_NAMESPACE_DEFAULT}"
           echo "K8S_NAMESPACE_RESOLVED=$NS" >> $GITHUB_ENV
 
-          # AKS RG/Name: prefer inputs, then secrets, then auto-detect
+          # AKS RG/Name: inputs -> secrets -> auto-detect
           AKS_RG="${IN_AKS_RG:-$SEC_AKS_RG}"
           AKS_NAME="${IN_AKS_NAME:-$SEC_AKS_NAME}"
-
           if [[ -z "$AKS_RG" || -z "$AKS_NAME" ]]; then
             echo "AKS RG/Name not provided; attempting auto-detect…" >&2
-            # Try to pick the first cluster in the subscription, or the first in a known RG
             if [[ -n "$SEC_AKS_RG" ]]; then
               AKS_NAME=$(az aks list -g "$SEC_AKS_RG" --query '[0].name' -o tsv 2>/dev/null || true)
               AKS_RG="$SEC_AKS_RG"
@@ -91,7 +88,6 @@ jobs:
               fi
             fi
           fi
-
           if [[ -z "$AKS_RG" || -z "$AKS_NAME" ]]; then
             echo "ERROR: aks_resource_group/aks_cluster_name not provided and could not auto-detect." >&2
             exit 1
@@ -99,17 +95,23 @@ jobs:
           echo "AKS_RESOURCE_GROUP=$AKS_RG" >> $GITHUB_ENV
           echo "AKS_CLUSTER_NAME=$AKS_NAME" >> $GITHUB_ENV
 
-          # ACR login server
+          # ACR login server: inputs -> secret (but we’ll resolve ACR name via Azure to avoid devacr/akdevacr mismatch)
           ACR_LOGIN_SERVER="${IN_ACR:-$SEC_ACR}"
           if [[ -z "$ACR_LOGIN_SERVER" ]]; then
             echo "ERROR: acr_login_server not provided and AZURE_CONTAINER_REGISTRY secret missing" >&2
             exit 1
           fi
           echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER" >> $GITHUB_ENV
-          ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
+
+          # Authoritatively get the ACR resource name from the login server
+          ACR_NAME=$(az acr list --query "[?loginServer=='${ACR_LOGIN_SERVER}'].name | [0]" -o tsv 2>/dev/null || true)
+          if [[ -z "$ACR_NAME" ]]; then
+            # Fallback: basename before first dot (best guess)
+            ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
+          fi
           echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
 
-          # Tag (default to latest)
+          # Tag (default latest)
           TAG="${IN_TAG:-latest}"
           echo "FRONTEND_TAG=$TAG" >> $GITHUB_ENV
 
@@ -133,25 +135,39 @@ jobs:
           az aks get-credentials -g "$AKS_RESOURCE_GROUP" -n "$AKS_CLUSTER_NAME" --overwrite-existing
           kubectl cluster-info
 
+      # Attach ACR to AKS (RBAC pull path) — idempotent
+      - name: Attach ACR to AKS
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          az aks update -g "$AKS_RESOURCE_GROUP" -n "$AKS_CLUSTER_NAME" --attach-acr "$ACR_NAME" || true
+
       - name: Ensure namespace exists
         shell: bash
         run: |
           kubectl get ns "$K8S_NAMESPACE_RESOLVED" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE_RESOLVED"
 
-      - name: Create/patch imagePullSecret (acr-pull)
+      # Optional: namespace imagePullSecret as a belt-and-braces fallback
+      - name: Create/patch imagePullSecret (acr-pull) if admin creds available
         shell: bash
         run: |
           set -Eeuo pipefail
           NS="$K8S_NAMESPACE_RESOLVED"
-          az acr update -n "$ACR_NAME" --admin-enabled true >/dev/null
-          ACR_USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
-          ACR_PASS=$(az acr credential show -n "$ACR_NAME" --query 'passwords[0].value' -o tsv)
-          kubectl -n "$NS" delete secret acr-pull --ignore-not-found
-          kubectl -n "$NS" create secret docker-registry acr-pull \
-            --docker-server="$ACR_LOGIN_SERVER" \
-            --docker-username="$ACR_USER" \
-            --docker-password="$ACR_PASS"
-          kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-pull"}]}' || true
+          # Try enabling admin (may be blocked by policy/RBAC; don’t fail the job)
+          if az acr update -n "$ACR_NAME" --admin-enabled true >/dev/null 2>&1; then
+            ACR_USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
+            ACR_PASS=$(az acr credential show -n "$ACR_NAME" --query 'passwords[0].value' -o tsv)
+            kubectl -n "$NS" delete secret acr-pull --ignore-not-found
+            kubectl -n "$NS" create secret docker-registry acr-pull \
+              --docker-server="$ACR_LOGIN_SERVER" \
+              --docker-username="$ACR_USER" \
+              --docker-password="$ACR_PASS"
+            kubectl -n "$NS" patch serviceaccount default \
+              -p '{"imagePullSecrets":[{"name":"acr-pull"}]}' || true
+            echo "Created imagePullSecret acr-pull."
+          else
+            echo "WARN: Could not enable/get ACR admin creds; relying on AKS attached ACR RBAC."
+          fi
 
       - name: Inject backend URLs into frontend/main.js (only if provided)
         if: ${{ inputs.product_api_ip || inputs.order_api_ip || inputs.customer_api_ip }}
@@ -161,10 +177,8 @@ jobs:
           [[ -n "${PRODUCT_URL:-}"  ]] && sed -i "s|_PRODUCT_API_URL_|${PRODUCT_URL}|g"     frontend/main.js
           [[ -n "${ORDER_URL:-}"    ]] && sed -i "s|_ORDER_API_URL_|${ORDER_URL}|g"         frontend/main.js
           [[ -n "${CUSTOMER_URL:-}" ]] && sed -i "s|_CUSTOMER_API_URL_|${CUSTOMER_URL}|g"   frontend/main.js
-          echo "Patched main.js with provided backend URLs."
 
-      # Normalize any hard-coded registry in the manifest
-      - name: Normalize frontend image registry to target ACR
+      - name: Normalize manifest registry to target ACR
         shell: bash
         env:
           ACR: ${{ env.ACR_LOGIN_SERVER }}
@@ -180,7 +194,7 @@ jobs:
       - name: Set image and rollout
         shell: bash
         env:
-          NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
+          NS:  ${{ env.K8S_NAMESPACE_RESOLVED }}
           ACR: ${{ env.ACR_LOGIN_SERVER }}
           TAG: ${{ env.FRONTEND_TAG }}
         run: |
