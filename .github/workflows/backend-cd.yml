@@ -31,7 +31,7 @@ permissions:
   contents: read
 
 env:
-  # Default namespace if caller forgets (we still require an input, but we’ll respect it)
+  # Default namespace (caller still passes their intended one)
   K8S_NAMESPACE: ecommerce
 
   # Deployment/Service names
@@ -60,7 +60,6 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Robust resolver: use inputs if present; else fall back to repo/environment secrets; else try auto-detect
       - name: Resolve inputs (namespace, AKS, ACR)
         shell: bash
         env:
@@ -74,71 +73,60 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          # Namespace (required input, but keep a sane default if someone triggers manually)
           NS_INPUT="${INPUT_NS:-${K8S_NAMESPACE}}"
           echo "K8S_NAMESPACE_RESOLVED=$NS_INPUT" >> $GITHUB_ENV
 
-          # AKS RG/Name: prefer inputs → secrets → fail
           AKS_RG="${INPUT_AKS_RG:-$SECRET_AKS_RG}"
           AKS_NAME="${INPUT_AKS_NAME:-$SECRET_AKS_NAME}"
-
           if [[ -z "$AKS_RG" || -z "$AKS_NAME" ]]; then
-            echo "AKS RG/Name not provided; attempting auto-detect from current subscription (this is best-effort)…"
-            # Try to pick a cluster in the same RG as an ACR we may have as secret
-            AKS_CANDIDATE="$(az aks list --query '[0].{rg:resourceGroup,name:name}' -o tsv 2>/dev/null || true)"
-            if [[ -n "$AKS_CANDIDATE" ]]; then
-              AKS_RG="$(echo "$AKS_CANDIDATE" | awk '{print $1}')"
-              AKS_NAME="$(echo "$AKS_CANDIDATE" | awk '{print $2}')"
-            fi
+            echo "ERROR: Missing aks_resource_group/aks_cluster_name"; exit 1
           fi
-
-          if [[ -z "$AKS_RG" || -z "$AKS_NAME" ]]; then
-            echo "ERROR: Missing aks_resource_group/aks_cluster_name and auto-detect failed."
-            exit 1
-          fi
-
           echo "AKS_RESOURCE_GROUP=$AKS_RG" >> $GITHUB_ENV
           echo "AKS_CLUSTER_NAME=$AKS_NAME" >> $GITHUB_ENV
 
-          # ACR login server: prefer input → secret → auto-detect in RG
           ACR_LOGIN="${INPUT_ACR_LOGIN:-$SECRET_ACR_LOGIN}"
           if [[ -z "$ACR_LOGIN" ]]; then
-            echo "ACR login not supplied; trying to auto-detect an ACR in RG '$AKS_RG'…"
-            ACR_LOGIN="$(az acr list -g "$AKS_RG" --query '[0].loginServer' -o tsv 2>/dev/null || true)"
-          fi
-          if [[ -z "$ACR_LOGIN" ]]; then
-            echo "ERROR: acr_login_server not provided, no secret set, and auto-detect failed."
-            exit 1
+            echo "ERROR: acr_login_server not provided or secret missing"; exit 1
           fi
           echo "ACR_LOGIN_SERVER=$ACR_LOGIN" >> $GITHUB_ENV
-
-          # Derive ACR name
           ACR_NAME="${ACR_LOGIN%%.*}"
           echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
 
-          echo "Resolved:"
-          echo "  Namespace         = $NS_INPUT"
-          echo "  AKS RG/Name       = $AKS_RG / $AKS_NAME"
-          echo "  ACR login server  = $ACR_LOGIN (name: $ACR_NAME)"
-
-      - name: Show AKS target (info)
+      # --- Fix 1: attach ACR to AKS (idempotent) ---
+      - name: Attach ACR to AKS (idempotent)
         shell: bash
         run: |
-          az aks show -g "$AKS_RESOURCE_GROUP" -n "$AKS_CLUSTER_NAME" -o table || true
+          set -Eeuo pipefail
+          az aks update -g "$AKS_RESOURCE_GROUP" -n "$AKS_CLUSTER_NAME" --attach-acr "$ACR_NAME" || true
 
       - name: Set AKS context
         shell: bash
         run: |
-          az aks get-credentials \
-            --resource-group "$AKS_RESOURCE_GROUP" \
-            --name "$AKS_CLUSTER_NAME" \
-            --overwrite-existing
+          az aks get-credentials -g "$AKS_RESOURCE_GROUP" -n "$AKS_CLUSTER_NAME" --overwrite-existing
           kubectl cluster-info
 
       - name: Ensure namespace exists
         shell: bash
         run: |
           kubectl get ns "$K8S_NAMESPACE_RESOLVED" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE_RESOLVED"
+
+      # --- Fix 2: fallback image pull secret (works immediately if role propagation is slow) ---
+      - name: Create/patch ACR imagePullSecret (fallback)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          NS="$K8S_NAMESPACE_RESOLVED"
+          # Ensure ACR admin is enabled to fetch a username/password
+          az acr update -n "$ACR_NAME" --admin-enabled true >/dev/null
+          ACR_USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
+          ACR_PASS=$(az acr credential show -n "$ACR_NAME" --query 'passwords[0].value' -o tsv)
+          kubectl -n "$NS" delete secret acr-pull --ignore-not-found
+          kubectl -n "$NS" create secret docker-registry acr-pull \
+            --docker-server="$ACR_LOGIN_SERVER" \
+            --docker-username="$ACR_USER" \
+            --docker-password="$ACR_PASS"
+          # Patch default SA so all pods use it
+          kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-pull"}]}' || true
 
       # Optional cleanup for fresh rollout
       - name: Delete old deployments (ignore if missing)
@@ -218,6 +206,7 @@ jobs:
           if [[ -z "$PRODUCT_IP" || -z "$ORDER_IP" || -z "$CUSTOMER_IP" ]]; then
             echo "ERROR: Service EXTERNAL-IPs not assigned"
             kubectl get svc -n "${NS}"
+            kubectl get pods -n "${NS}"
             exit 1
           fi
           echo "PRODUCT_IP=$PRODUCT_IP"   >> $GITHUB_ENV
