@@ -240,9 +240,9 @@ jobs:
           fi
           az role assignment create --assignee "$OID" --role "AcrPull" --scope "$ACR_ID" >/dev/null 2>&1 || echo "AcrPull already assigned"
 
-      - name: Install jq (for parsing TF outputs)
+      - name: Install jq (for JSON patch helper)
         run: |
-          if ! command -v jq >/dev/null 2>&1; then
+          if ! command -v jq >/dev/null 2%; then
             sudo apt-get update && sudo apt-get install -y jq
           fi
 
@@ -277,16 +277,25 @@ jobs:
         id: meta
         env:
           PROD_ACR_LOGIN:    ${{ needs.infra_prod.outputs.prod_acr }}
-          DEV_ACR_LOGIN_VAR: ${{ vars.DEV_ACR_LOGIN_SERVER }} # set repo variable to "akdevacr.azurecr.io"
+          DEV_ACR_LOGIN_VAR: ${{ vars.DEV_ACR_LOGIN_SERVER }} # e.g. "akdevacr.azurecr.io"
+        shell: bash
         run: |
           set -Eeuo pipefail
+
+          # 1) Tag from PR SHA
           PR_SHA="${{ github.event.pull_request.head.sha }}"
           TAG="${PR_SHA:0:7}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-          DEV_ACR_LOGIN="$DEV_ACR_LOGIN_VAR"
+          # 2) Resolve DEV ACR login server (must be provided via repo variable)
+          DEV_ACR_LOGIN="${DEV_ACR_LOGIN_VAR:-}"
+          if [ -z "$DEV_ACR_LOGIN" ]; then
+            echo "ERROR: Repository variable DEV_ACR_LOGIN_SERVER is not set. Set it to your DEV ACR login server (e.g. 'akdevacr.azurecr.io')." >&2
+            exit 1
+          fi
           DEV_ACR_NAME="${DEV_ACR_LOGIN%%.*}"
 
+          # 3) Read digests for the TAG using non-deprecated API
           repo_prod=product_service
           repo_ordr=order_service
           repo_cust=customer_service
@@ -294,8 +303,9 @@ jobs:
 
           get_digest () {
             local repo="$1"
-            az acr repository show-manifests -n "$DEV_ACR_NAME" --repository "$repo" \
-              --orderby time_desc --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv
+            az acr manifest list-metadata --registry "$DEV_ACR_NAME" --name "$repo" \
+              --orderby time_desc \
+              --query "[?tags && contains(join(',', tags), '$TAG')][0].digest" -o tsv
           }
 
           D_PROD=$(get_digest "$repo_prod");   D_PROD=${D_PROD#sha256:}
@@ -313,7 +323,8 @@ jobs:
           echo "d_cust=$D_CUST"   >> "$GITHUB_OUTPUT"
           echo "d_front=$D_FRONT" >> "$GITHUB_OUTPUT"
 
-          DST_LOGIN="$PROD_ACR_LOGIN"
+          # 4) Import into PROD ACR
+          DST_LOGIN="${PROD_ACR_LOGIN}"
           DST_NAME="${DST_LOGIN%%.*}"
           az acr import --name "$DST_NAME" --source "$DEV_ACR_LOGIN/$repo_prod@sha256:$D_PROD"   --image $repo_prod:$TAG
           az acr import --name "$DST_NAME" --source "$DEV_ACR_LOGIN/$repo_ordr@sha256:$D_ORDR"   --image $repo_ordr:$TAG
