@@ -69,23 +69,23 @@ jobs:
         run: |
           set -Eeuo pipefail
           NS_INPUT="${INPUT_NS:-${K8S_NAMESPACE}}"
-          echo "K8S_NAMESPACE_RESOLVED=$NS_INPUT" >> "$GITHUB_ENV"
+          echo "K8S_NAMESPACE_RESOLVED=$NS_INPUT" >> $GITHUB_ENV
 
           AKS_RG="${INPUT_AKS_RG:-$SECRET_AKS_RG}"
           AKS_NAME="${INPUT_AKS_NAME:-$SECRET_AKS_NAME}"
           if [[ -z "$AKS_RG" || -z "$AKS_NAME" ]]; then
             echo "ERROR: Missing aks_resource_group/aks_cluster_name"; exit 1
           fi
-          echo "AKS_RESOURCE_GROUP=$AKS_RG" >> "$GITHUB_ENV"
-          echo "AKS_CLUSTER_NAME=$AKS_NAME" >> "$GITHUB_ENV"
+          echo "AKS_RESOURCE_GROUP=$AKS_RG" >> $GITHUB_ENV
+          echo "AKS_CLUSTER_NAME=$AKS_NAME" >> $GITHUB_ENV
 
           ACR_LOGIN="${INPUT_ACR_LOGIN:-$SECRET_ACR_LOGIN}"
           if [[ -z "$ACR_LOGIN" ]]; then
             echo "ERROR: acr_login_server not provided or secret missing"; exit 1
           fi
-          echo "ACR_LOGIN_SERVER=$ACR_LOGIN" >> "$GITHUB_ENV"
+          echo "ACR_LOGIN_SERVER=$ACR_LOGIN" >> $GITHUB_ENV
           ACR_NAME="${ACR_LOGIN%%.*}"
-          echo "ACR_NAME=$ACR_NAME" >> "$GITHUB_ENV"
+          echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
 
       - name: Attach ACR to AKS (idempotent)
         shell: bash
@@ -104,11 +104,12 @@ jobs:
         run: |
           kubectl get ns "$K8S_NAMESPACE_RESOLVED" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE_RESOLVED"
 
-      - name: Create/patch imagePullSecret (acr-pull, best-effort)
+      - name: Create/patch imagePullSecret (acr-pull)
         shell: bash
         run: |
           set -Eeuo pipefail
           NS="$K8S_NAMESPACE_RESOLVED"
+          # best-effort; ignore if policy disallows admin creds
           if az acr update -n "$ACR_NAME" --admin-enabled true >/dev/null 2>&1; then
             ACR_USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
             ACR_PASS=$(az acr credential show -n "$ACR_NAME" --query 'passwords[0].value' -o tsv)
@@ -118,8 +119,6 @@ jobs:
               --docker-username="$ACR_USER" \
               --docker-password="$ACR_PASS"
             kubectl -n "$NS" patch serviceaccount default -p '{"imagePullSecrets":[{"name":"acr-pull"}]}' || true
-          else
-            echo "WARN: ACR admin creds unavailable; relying on AKS–ACR RBAC."
           fi
 
       - name: Patch DB/RabbitMQ images to ECR Public mirrors
@@ -139,10 +138,11 @@ jobs:
           ACR: ${{ env.ACR_LOGIN_SERVER }}
         run: |
           set -Eeuo pipefail
-          sed -i -E "s|image:\s*[A-Za-z0-9.-]+\.azurecr\.io/product_service:[^[:space:]]+|image: ${ACR}/product_service:latest|g" k8s/*.yaml || true
-          sed -i -E "s|image:\s*[A-Za-z0-9.-]+\.azurecr\.io/order_service:[^[:space:]]+|image: ${ACR}/order_service:latest|g"   k8s/*.yaml || true
+          sed -i -E "s|image:\s*[A-Za-z0-9.-]+\.azurecr\.io/product_service:[^[:space:]]+|image: ${ACR}/product_service:latest|g"   k8s/*.yaml || true
+          sed -i -E "s|image:\s*[A-Za-z0-9.-]+\.azurecr\.io/order_service:[^[:space:]]+|image: ${ACR}/order_service:latest|g"     k8s/*.yaml || true
           sed -i -E "s|image:\s*[A-Za-z0-9.-]+\.azurecr\.io/customer_service:[^[:space:]]+|image: ${ACR}/customer_service:latest|g" k8s/*.yaml || true
 
+      # Optional cleanup for fresh rollout
       - name: Delete old deployments (ignore if missing)
         shell: bash
         env:
@@ -179,7 +179,7 @@ jobs:
             echo "WARN: RabbitMQ workload not found; continuing"
           fi
 
-      - name: Apply DBs and Backend services
+      - name: Apply DBs and Backend services (with corrected targetPorts)
         shell: bash
         env:
           NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
@@ -209,6 +209,21 @@ jobs:
           kubectl -n ${NS} rollout status deploy/${{ env.ORDER_DEPLOY }}    --timeout=300s
           kubectl -n ${NS} rollout status deploy/${{ env.CUSTOMER_DEPLOY }} --timeout=300s
 
+      - name: In-cluster smoke checks (bypass LB)
+        shell: bash
+        env:
+          NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
+        run: |
+          set -Eeuo pipefail
+          kubectl -n "$NS" run curl --image=curlimages/curl:8.10.1 --restart=Never -i --rm -- \
+            sh -c '
+              set -e
+              echo "[product]";  for i in $(seq 1 30); do curl -fsS http://product-service-w05-aks:8000/health  && break || sleep 5; done
+              echo "[order]";    for i in $(seq 1 30); do curl -fsS http://order-service-w05-aks:8001/health    && break || sleep 5; done
+              echo "[customer]"; for i in $(seq 1 30); do curl -fsS http://customer-service-w05-aks:8002/health && break || sleep 5; done
+              echo OK
+            '
+
       - name: Wait for Backend LoadBalancer IPs
         shell: bash
         env:
@@ -216,7 +231,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           echo "Waiting for EXTERNAL-IPs in namespace ${NS}..."
-          for i in $(seq 1 60); do
+          for i in $(seq 1 90); do
             PRODUCT_IP=$(kubectl get svc -n ${NS} "$PRODUCT_SVC_NAME"  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
             ORDER_IP=$(kubectl   get svc -n ${NS} "$ORDER_SVC_NAME"    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
             CUSTOMER_IP=$(kubectl get svc -n ${NS} "$CUSTOMER_SVC_NAME" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
@@ -225,42 +240,47 @@ jobs:
           done
           if [[ -z "$PRODUCT_IP" || -z "$ORDER_IP" || -z "$CUSTOMER_IP" ]]; then
             echo "ERROR: Service EXTERNAL-IPs not assigned"
-            kubectl get pods -n ${NS}
-            kubectl get svc  -n ${NS}
+            kubectl get svc -n ${NS}
             exit 1
           fi
-          echo "PRODUCT_IP=$PRODUCT_IP"   >> "$GITHUB_ENV"
-          echo "ORDER_IP=$ORDER_IP"       >> "$GITHUB_ENV"
-          echo "CUSTOMER_IP=$CUSTOMER_IP" >> "$GITHUB_ENV"
+          echo "PRODUCT_IP=$PRODUCT_IP"   >> $GITHUB_ENV
+          echo "ORDER_IP=$ORDER_IP"       >> $GITHUB_ENV
+          echo "CUSTOMER_IP=$CUSTOMER_IP" >> $GITHUB_ENV
 
       - id: get_product_ip
-        run: echo "external_ip=${{ env.PRODUCT_IP }}" >> "$GITHUB_OUTPUT"
+        run: echo "external_ip=${{ env.PRODUCT_IP }}" >> $GITHUB_OUTPUT
       - id: get_order_ip
-        run: echo "external_ip=${{ env.ORDER_IP }}" >> "$GITHUB_OUTPUT"
+        run: echo "external_ip=${{ env.ORDER_IP }}" >> $GITHUB_OUTPUT
       - id: get_customer_ip
-        run: echo "external_ip=${{ env.CUSTOMER_IP }}" >> "$GITHUB_OUTPUT"
+        run: echo "external_ip=${{ env.CUSTOMER_IP }}" >> $GITHUB_OUTPUT
 
-      - name: Quick smoke checks (backends)
+      - name: External smoke checks (retry while LB warms up)
         shell: bash
         env:
-          PRODUCT_IP:  ${{ env.PRODUCT_IP }}
-          ORDER_IP:    ${{ env.ORDER_IP }}
-          CUSTOMER_IP: ${{ env.CUSTOMER_IP }}
+          PROD_IP:  ${{ env.PRODUCT_IP }}
+          ORDER_IP: ${{ env.ORDER_IP }}
+          CUST_IP:  ${{ env.CUSTOMER_IP }}
         run: |
           set -Eeuo pipefail
-          try() { local url="$1"; echo "GET $url"; curl -fsS "$url" >/dev/null; }
-          try "http://$PRODUCT_IP:8000/health"   || try "http://$PRODUCT_IP:8000/"
-          try "http://$ORDER_IP:8001/health"     || try "http://$ORDER_IP:8001/"
-          try "http://$CUSTOMER_IP:8002/health"  || try "http://$CUSTOMER_IP:8002/"
-          echo "Backends responded."
+          check() {
+            local url="$1"
+            for i in $(seq 1 60); do
+              echo "GET $url (try $i/60)"
+              curl -fsS --max-time 5 "$url" && return 0 || sleep 5
+            done
+            return 1
+          }
+          check "http://${PROD_IP}:8000/health"
+          check "http://${ORDER_IP}:8001/health"
+          check "http://${CUST_IP}:8002/health"
 
       - name: Summary
         shell: bash
         run: |
-          echo "### Backend Service IPs (namespace: ${K8S_NAMESPACE_RESOLVED})" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Product:  http://${PRODUCT_IP}:8000"  >> "$GITHUB_STEP_SUMMARY"
-          echo "- Order:    http://${ORDER_IP}:8001"    >> "$GITHUB_STEP_SUMMARY"
-          echo "- Customer: http://${CUSTOMER_IP}:8002" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Backend Service IPs (namespace: ${K8S_NAMESPACE_RESOLVED})" >> $GITHUB_STEP_SUMMARY
+          echo "- Product:  http://${PRODUCT_IP}:8000"  >> $GITHUB_STEP_SUMMARY
+          echo "- Order:    http://${ORDER_IP}:8001"    >> $GITHUB_STEP_SUMMARY
+          echo "- Customer: http://${CUSTOMER_IP}:8002" >> $GITHUB_STEP_SUMMARY
 
       - name: Logout Azure
         if: always()
