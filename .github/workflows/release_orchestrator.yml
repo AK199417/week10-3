@@ -240,9 +240,9 @@ jobs:
           fi
           az role assignment create --assignee "$OID" --role "AcrPull" --scope "$ACR_ID" >/dev/null 2>&1 || echo "AcrPull already assigned"
 
-      - name: Install jq (for JSON patch helper)
+      - name: Install jq (for parsing TF outputs)
         run: |
-          if ! command -v jq >/dev/null 2%; then
+          if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y jq
           fi
 
@@ -273,12 +273,11 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Collect digests from DEV and import into PROD
+      - name: Collect digests from DEV and import into PROD (auto-detect DEV ACR)
         id: meta
-        env:
-          PROD_ACR_LOGIN:    ${{ needs.infra_prod.outputs.prod_acr }}
-          DEV_ACR_LOGIN_VAR: ${{ vars.DEV_ACR_LOGIN_SERVER }} # e.g. "akdevacr.azurecr.io"
         shell: bash
+        env:
+          PROD_ACR_LOGIN: ${{ needs.infra_prod.outputs.prod_acr }}
         run: |
           set -Eeuo pipefail
 
@@ -287,15 +286,25 @@ jobs:
           TAG="${PR_SHA:0:7}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-          # 2) Resolve DEV ACR login server (must be provided via repo variable)
-          DEV_ACR_LOGIN="${DEV_ACR_LOGIN_VAR:-}"
-          if [ -z "$DEV_ACR_LOGIN" ]; then
-            echo "ERROR: Repository variable DEV_ACR_LOGIN_SERVER is not set. Set it to your DEV ACR login server (e.g. 'akdevacr.azurecr.io')." >&2
+          # 2) Resolve DEV ACR login server:
+          #    a) try a well-known name 'akdevacr'
+          #    b) else: first ACR in the subscription
+          resolve_dev_acr() {
+            if az acr show -n akdevacr -o none 2>/dev/null; then
+              az acr show -n akdevacr --query loginServer -o tsv
+              return
+            fi
+            az acr list --query '[0].loginServer' -o tsv
+          }
+          DEV_ACR_LOGIN="$(resolve_dev_acr || true)"
+          if [[ -z "$DEV_ACR_LOGIN" ]]; then
+            echo "ERROR: Could not determine DEV ACR login server. Create 'akdevacr' or ensure at least one ACR exists in the subscription." >&2
             exit 1
           fi
           DEV_ACR_NAME="${DEV_ACR_LOGIN%%.*}"
+          echo "Using DEV ACR: $DEV_ACR_LOGIN (name: $DEV_ACR_NAME)"
 
-          # 3) Read digests for the TAG using non-deprecated API
+          # 3) Read digests for the TAG (non-deprecated command)
           repo_prod=product_service
           repo_ordr=order_service
           repo_cust=customer_service
@@ -373,7 +382,7 @@ jobs:
 
       - name: Install jq (for JSON patch helper)
         run: |
-          if ! command -v jq >/dev/null 2>&1; then
+          if ! command -v jq >/dev/null 2>/dev/null; then
             sudo apt-get update && sudo apt-get install -y jq
           fi
 
