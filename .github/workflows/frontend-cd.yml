@@ -70,7 +70,7 @@ jobs:
 
           # Namespace
           NS="${IN_NS:-$K8S_NAMESPACE_DEFAULT}"
-          echo "K8S_NAMESPACE_RESOLVED=$NS" >> $GITHUB_ENV
+          echo "K8S_NAMESPACE_RESOLVED=$NS" >> "$GITHUB_ENV"
 
           # AKS RG/Name: inputs -> secrets -> auto-detect
           AKS_RG="${IN_AKS_RG:-$SEC_AKS_RG}"
@@ -92,8 +92,8 @@ jobs:
             echo "ERROR: aks_resource_group/aks_cluster_name not provided and could not auto-detect." >&2
             exit 1
           fi
-          echo "AKS_RESOURCE_GROUP=$AKS_RG" >> $GITHUB_ENV
-          echo "AKS_CLUSTER_NAME=$AKS_NAME" >> $GITHUB_ENV
+          echo "AKS_RESOURCE_GROUP=$AKS_RG" >> "$GITHUB_ENV"
+          echo "AKS_CLUSTER_NAME=$AKS_NAME" >> "$GITHUB_ENV"
 
           # ACR login server: inputs -> secret, then resolve ACR name via Azure
           ACR_LOGIN_SERVER="${IN_ACR:-$SEC_ACR}"
@@ -101,30 +101,21 @@ jobs:
             echo "ERROR: acr_login_server not provided and AZURE_CONTAINER_REGISTRY secret missing" >&2
             exit 1
           fi
-          echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER" >> $GITHUB_ENV
+          echo "ACR_LOGIN_SERVER=$ACR_LOGIN_SERVER" >> "$GITHUB_ENV"
           ACR_NAME=$(az acr list --query "[?loginServer=='${ACR_LOGIN_SERVER}'].name | [0]" -o tsv 2>/dev/null || true)
           if [[ -z "$ACR_NAME" ]]; then
             ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
           fi
-          echo "ACR_NAME=$ACR_NAME" >> $GITHUB_ENV
+          echo "ACR_NAME=$ACR_NAME" >> "$GITHUB_ENV"
 
           # Tag (default latest)
           TAG="${IN_TAG:-latest}"
-          echo "FRONTEND_TAG=$TAG" >> $GITHUB_ENV
+          echo "FRONTEND_TAG=$TAG" >> "$GITHUB_ENV"
 
           # Optional backend URLs → only used if provided
-          [[ -n "${IN_PROD_URL}"  ]] && echo "PRODUCT_URL=$IN_PROD_URL"   >> $GITHUB_ENV
-          [[ -n "${IN_ORDER_URL}" ]] && echo "ORDER_URL=$IN_ORDER_URL"    >> $GITHUB_ENV
-          [[ -n "${IN_CUST_URL}"  ]] && echo "CUSTOMER_URL=$IN_CUST_URL"  >> $GITHUB_ENV
-
-          echo "Resolved:"
-          echo "  Namespace  = $NS"
-          echo "  AKS        = $AKS_RG / $AKS_NAME"
-          echo "  ACR        = $ACR_LOGIN_SERVER (name: $ACR_NAME)"
-          echo "  Tag        = $TAG"
-          echo "  ProductURL = ${IN_PROD_URL:-<unchanged>}"
-          echo "  OrderURL   = ${IN_ORDER_URL:-<unchanged>}"
-          echo "  CustomerURL= ${IN_CUST_URL:-<unchanged>}"
+          [[ -n "${IN_PROD_URL}"  ]] && echo "PRODUCT_URL=$IN_PROD_URL"   >> "$GITHUB_ENV"
+          [[ -n "${IN_ORDER_URL}" ]] && echo "ORDER_URL=$IN_ORDER_URL"    >> "$GITHUB_ENV"
+          [[ -n "${IN_CUST_URL}"  ]] && echo "CUSTOMER_URL=$IN_CUST_URL"  >> "$GITHUB_ENV"
 
       - name: Set AKS context
         shell: bash
@@ -148,7 +139,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           NS="$K8S_NAMESPACE_RESOLVED"
-          # Best effort: admin creds may be disabled by policy; ignore failures
           if az acr update -n "$ACR_NAME" --admin-enabled true >/dev/null 2>&1; then
             ACR_USER=$(az acr credential show -n "$ACR_NAME" --query username -o tsv)
             ACR_PASS=$(az acr credential show -n "$ACR_NAME" --query 'passwords[0].value' -o tsv)
@@ -196,14 +186,12 @@ jobs:
             ${{ env.FRONTEND_CONTAINER }}=${ACR}/frontend:${TAG}
           kubectl -n "${NS}" rollout restart deploy/${{ env.FRONTEND_DEPLOY }}
 
-      # ---- Robust readiness check (handles "old replica pending termination") ----
       - name: Wait for new ReplicaSet Ready (soft check)
         shell: bash
         env:
           NS:  ${{ env.K8S_NAMESPACE_RESOLVED }}
         run: |
           set -Eeuo pipefail
-          # Wait up to ~6 min for Ready & Updated replicas
           for i in $(seq 1 72); do
             READY=$(kubectl -n "$NS" get deploy/${{ env.FRONTEND_DEPLOY }} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
             UPD=$(kubectl   -n "$NS" get deploy/${{ env.FRONTEND_DEPLOY }} -o jsonpath='{.status.updatedReplicas}' 2>/dev/null || echo 0)
@@ -216,7 +204,26 @@ jobs:
             sleep 5
           done
           echo "Timed out waiting for frontend to become ready."
-          # Fall through; mark failure so diagnostics run
+          exit 1
+
+      - name: Quick smoke check (frontend)
+        if: ${{ success() }}
+        shell: bash
+        env:
+          NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
+        run: |
+          set -Eeuo pipefail
+          SVC_IP=$(kubectl -n "$NS" get svc frontend-w05-aks -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Frontend LB IP: $SVC_IP"
+          for i in $(seq 1 20); do
+            echo "Attempt $i: curl http://$SVC_IP/"
+            if curl -fsS "http://$SVC_IP/" >/dev/null; then
+              echo "OK"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Frontend did not respond in time."
           exit 1
 
       - name: Diagnostics on failure
