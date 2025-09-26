@@ -156,10 +156,10 @@ jobs:
       aks_cluster_name:   ${{ needs.infra_dev.outputs.dev_aks_name }}
       aks_resource_group: ${{ needs.infra_dev.outputs.dev_aks_rg }}
       acr_login_server:   ${{ needs.infra_dev.outputs.dev_acr }}
-      # frontend_tag omitted -> defaults to 'latest' in reusable workflow
+      # frontend_tag omitted -> defaults to 'latest'
     secrets: inherit
 
-    # ===================== PROD =====================
+  # ===================== PROD =====================
   infra_prod:
     if: ${{ github.event_name == 'pull_request'
             && github.event.pull_request.merged == true
@@ -175,6 +175,7 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
       - uses: hashicorp/setup-terraform@v3
+
       - name: Terraform init (PROD)
         working-directory: infra
         run: terraform init

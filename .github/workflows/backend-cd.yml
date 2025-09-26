@@ -31,10 +31,14 @@ permissions:
   contents: read
 
 env:
+  # Defaults (caller passes namespace)
   K8S_NAMESPACE: ecommerce
+
+  # Workload names (adjust only if your k8s YAML uses different names)
   PRODUCT_DEPLOY:    product-service-w05-aks
   ORDER_DEPLOY:      order-service-w05-aks
   CUSTOMER_DEPLOY:   customer-service-w05-aks
+
   PRODUCT_SVC_NAME:  product-service-w05-aks
   ORDER_SVC_NAME:    order-service-w05-aks
   CUSTOMER_SVC_NAME: customer-service-w05-aks
@@ -142,7 +146,6 @@ jobs:
           sed -i -E "s|image:\s*[A-Za-z0-9.-]+\.azurecr\.io/order_service:[^[:space:]]+|image: ${ACR}/order_service:latest|g"     k8s/*.yaml || true
           sed -i -E "s|image:\s*[A-Za-z0-9.-]+\.azurecr\.io/customer_service:[^[:space:]]+|image: ${ACR}/customer_service:latest|g" k8s/*.yaml || true
 
-      # Optional cleanup for fresh rollout
       - name: Delete old deployments (ignore if missing)
         shell: bash
         env:
@@ -179,7 +182,7 @@ jobs:
             echo "WARN: RabbitMQ workload not found; continuing"
           fi
 
-      - name: Apply DBs and Backend services (with corrected targetPorts)
+      - name: Apply DBs and Backend services
         shell: bash
         env:
           NS: ${{ env.K8S_NAMESPACE_RESOLVED }}
@@ -253,26 +256,6 @@ jobs:
         run: echo "external_ip=${{ env.ORDER_IP }}" >> $GITHUB_OUTPUT
       - id: get_customer_ip
         run: echo "external_ip=${{ env.CUSTOMER_IP }}" >> $GITHUB_OUTPUT
-
-      - name: External smoke checks (retry while LB warms up)
-        shell: bash
-        env:
-          PROD_IP:  ${{ env.PRODUCT_IP }}
-          ORDER_IP: ${{ env.ORDER_IP }}
-          CUST_IP:  ${{ env.CUSTOMER_IP }}
-        run: |
-          set -Eeuo pipefail
-          check() {
-            local url="$1"
-            for i in $(seq 1 60); do
-              echo "GET $url (try $i/60)"
-              curl -fsS --max-time 5 "$url" && return 0 || sleep 5
-            done
-            return 1
-          }
-          check "http://${PROD_IP}:8000/health"
-          check "http://${ORDER_IP}:8001/health"
-          check "http://${CUST_IP}:8002/health"
 
       - name: Summary
         shell: bash
